@@ -1,0 +1,16 @@
+# Python venv
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables (sensitive keys)
+.env
+
+# macOS system files
+.DS_Store
+
+# Logs
+*.log
+
+# VS Code settings (optional, keeps your local setup private)
+.vscode/
