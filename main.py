@@ -96,6 +96,7 @@ async def ask(request: AskRequest):
     # 2. Retrieve top chunks from Supabase (using your match_documents function)
     results = supabase.rpc("match_documents", {
         "query_embedding": embedding,
+        "match_threshold": 0.75,   
         "match_count": 5,
         "org_id": request.org_id
     }).execute()
