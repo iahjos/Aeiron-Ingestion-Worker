@@ -87,10 +87,11 @@ async def ask(request: AskRequest):
     Accept org_id + question, retrieve context, and return GPT answer.
     """
     # 1. Embed the question
-    embedding = openai.embeddings.create(
+    response = openai.embeddings.create(
         model="text-embedding-3-small",
         input=request.question
-    )["data"][0]["embedding"]
+    )
+    embedding = response.data[0].embedding
 
     # 2. Retrieve top chunks from Supabase (using your match_documents function)
     results = supabase.rpc("match_documents", {
