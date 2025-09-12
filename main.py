@@ -27,6 +27,8 @@ supabase = create_client(
 class AskRequest(BaseModel):
     org_id: str
     question: str
+    match_threshold: float = 0.75   # default if not provided
+    match_count: int = 5            # default if not provided
 
 
 # ==========================
@@ -96,8 +98,8 @@ async def ask(request: AskRequest):
     # 2. Retrieve top chunks from Supabase (using your match_documents function)
     results = supabase.rpc("match_documents", {
         "query_embedding": embedding,
-        "match_threshold": 0.75,   
-        "match_count": 5,
+        "match_threshold": request.match_threshold,
+        "match_count": request.match_count,
         "org_id": request.org_id
     }).execute()
 
