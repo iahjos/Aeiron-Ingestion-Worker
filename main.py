@@ -29,12 +29,9 @@ supabase = create_client(
 class AskRequest(BaseModel):
     org_id: str
     question: str
-    # Retrieval controls
     match_threshold: float = 0.3
     match_count: int = 8
-    # Debug + Mode
     debug: bool = False
-    # "strict" => use ONLY org docs; "blend" => allow model priors for predictive questions
     mode: str = "blend"  # "strict" | "blend"
 
 # ==========================
@@ -100,9 +97,6 @@ def root():
 
 @app.post("/upload")
 async def upload_file(file: UploadFile, org_id: str = Form(...)):
-    """
-    Handle file upload, parse, embed, and store in Supabase.
-    """
     file_location = f"/tmp/{file.filename}"
     with open(file_location, "wb") as f:
         f.write(await file.read())
@@ -120,24 +114,29 @@ async def upload_file(file: UploadFile, org_id: str = Form(...)):
 
 @app.post("/ingest")
 async def ingest_file(payload: dict):
-    """
-    Triggered by Supabase when a new document is inserted.
-    Downloads, extracts, embeds, and stores chunks in Supabase.
-    """
     doc_id = payload.get("doc_id")
     org_id = payload.get("org_id")
     file_path = payload.get("file_path")
+    file_url = payload.get("file_url")  # NEW: signed URL from trigger
 
-    if not (doc_id and org_id and file_path):
-        return {"error": "Missing doc_id, org_id, or file_path"}
+    if not (doc_id and org_id and (file_path or file_url)):
+        return {"error": "Missing doc_id, org_id, and file reference"}
 
-    # Build Supabase public file URL
-    file_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/{file_path}"
-
-    tmp_path = f"/tmp/{os.path.basename(file_path)}"
-    resp = requests.get(file_url)
-    with open(tmp_path, "wb") as f:
-        f.write(resp.content)
+    # Decide how to download
+    if file_url:
+        resp = requests.get(file_url)
+        resp.raise_for_status()
+        tmp_path = f"/tmp/{os.path.basename(file_url)}"
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
+    else:
+        # fallback to public path
+        public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/{file_path}"
+        resp = requests.get(public_url)
+        resp.raise_for_status()
+        tmp_path = f"/tmp/{os.path.basename(file_path)}"
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
 
     # Extract text
     if tmp_path.endswith(".pdf"):
@@ -156,7 +155,7 @@ async def ingest_file(payload: dict):
     chunk_size = 500
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-    # Embed + insert
+    # Embed + insert into Supabase
     for idx, chunk in enumerate(chunks):
         emb = openai.embeddings.create(
             model="text-embedding-3-small",
@@ -172,14 +171,10 @@ async def ingest_file(payload: dict):
             "embedding": embedding
         }).execute()
 
-    return {"message": f"Ingested {len(chunks)} chunks for {file_path}"}
+    return {"message": f"Ingested {len(chunks)} chunks for {doc_id}"}
 
 @app.post("/ask")
 async def ask(request: AskRequest):
-    """
-    Accept org_id + question, retrieve context, and return GPT answer.
-    Blend mode: for predictive questions, carefully allow general knowledge with labels.
-    """
     predictive = is_predictive(request.question)
     allow_general = (request.mode == "blend") and predictive
 
