@@ -114,4 +114,8 @@ async def ask(request: AskRequest):
         ]
     )
 
-    return {"answer": completion.choices[0].message.content}
+    return {
+        "answer": completion.choices[0].message.content,
+        "chunks": results.data  # 👈 show what came back from Supabase
+    }
+
