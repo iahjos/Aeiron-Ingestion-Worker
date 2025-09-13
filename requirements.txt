@@ -7,3 +7,4 @@ python-docx   # for .docx parsing
 pandas        # for CSV parsing
 python-dotenv
 python-multipart
+requests
