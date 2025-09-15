@@ -8,6 +8,9 @@ import docx
 import pandas as pd
 import re
 import requests
+import asyncio
+import asyncpg
+import json
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -21,6 +24,8 @@ supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
+
+DATABASE_URL = os.getenv("SUPABASE_DB_URL")  # Full Postgres URL (from Supabase settings)
 
 # ==========================
 # MODELS
@@ -88,6 +93,65 @@ def summarize_chunks_for_context(rows):
     return "\n\n".join(r.get("content", "") for r in rows if r.get("content"))
 
 # ==========================
+# INGESTION CORE LOGIC (reusable)
+# ==========================
+
+async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
+    try:
+        # Decide how to fetch file
+        if file_url:
+            resp = requests.get(file_url)
+            resp.raise_for_status()
+            tmp_path = f"/tmp/{os.path.basename(file_url)}"
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+        else:
+            public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/{storage_path}"
+            resp = requests.get(public_url)
+            resp.raise_for_status()
+            tmp_path = f"/tmp/{os.path.basename(storage_path)}"
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+
+        # Extract text
+        if tmp_path.endswith(".pdf"):
+            text = extract_text_from_pdf(tmp_path)
+        elif tmp_path.endswith(".docx"):
+            text = extract_text_from_docx(tmp_path)
+        elif tmp_path.endswith(".csv"):
+            text = extract_text_from_csv(tmp_path)
+        else:
+            text = ""
+
+        if not text.strip():
+            print(f"❌ No text extracted for {doc_id}")
+            return
+
+        # Split into chunks
+        chunk_size = 500
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+        # Embed + insert
+        for idx, chunk in enumerate(chunks):
+            emb = openai.embeddings.create(
+                model="text-embedding-3-small",
+                input=chunk
+            )
+            embedding = emb.data[0].embedding
+
+            supabase.table("doc_chunks").insert({
+                "doc_id": doc_id,
+                "org_id": org_id,
+                "chunk_index": idx,
+                "content": chunk,
+                "embedding": embedding
+            }).execute()
+
+        print(f"✅ Ingested {len(chunks)} chunks for {doc_id}")
+    except Exception as e:
+        print(f"❌ Ingestion failed for {doc_id}: {e}")
+
+# ==========================
 # ROUTES
 # ==========================
 
@@ -114,64 +178,14 @@ async def upload_file(file: UploadFile, org_id: str = Form(...)):
 
 @app.post("/ingest")
 async def ingest_file(payload: dict):
-    doc_id = payload.get("doc_id")
-    org_id = payload.get("org_id")
-    file_path = payload.get("file_path")
-    file_url = payload.get("file_url")  # NEW: signed URL from trigger
-
-    if not (doc_id and org_id and (file_path or file_url)):
-        return {"error": "Missing doc_id, org_id, and file reference"}
-
-    # Decide how to download
-    if file_url:
-        resp = requests.get(file_url)
-        resp.raise_for_status()
-        tmp_path = f"/tmp/{os.path.basename(file_url)}"
-        with open(tmp_path, "wb") as f:
-            f.write(resp.content)
-    else:
-        # fallback to public path
-        public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/{file_path}"
-        resp = requests.get(public_url)
-        resp.raise_for_status()
-        tmp_path = f"/tmp/{os.path.basename(file_path)}"
-        with open(tmp_path, "wb") as f:
-            f.write(resp.content)
-
-    # Extract text
-    if tmp_path.endswith(".pdf"):
-        text = extract_text_from_pdf(tmp_path)
-    elif tmp_path.endswith(".docx"):
-        text = extract_text_from_docx(tmp_path)
-    elif tmp_path.endswith(".csv"):
-        text = extract_text_from_csv(tmp_path)
-    else:
-        text = ""
-
-    if not text.strip():
-        return {"error": "No text extracted"}
-
-    # Split into chunks
-    chunk_size = 500
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-
-    # Embed + insert into Supabase
-    for idx, chunk in enumerate(chunks):
-        emb = openai.embeddings.create(
-            model="text-embedding-3-small",
-            input=chunk
-        )
-        embedding = emb.data[0].embedding
-
-        supabase.table("doc_chunks").insert({
-            "doc_id": doc_id,
-            "org_id": org_id,
-            "chunk_index": idx,
-            "content": chunk,
-            "embedding": embedding
-        }).execute()
-
-    return {"message": f"Ingested {len(chunks)} chunks for {doc_id}"}
+    await run_ingestion(
+        doc_id=payload.get("doc_id"),
+        org_id=payload.get("org_id"),
+        storage_path=payload.get("file_path"),
+        file_type=payload.get("file_type"),
+        file_url=payload.get("file_url")
+    )
+    return {"message": f"Ingestion triggered for {payload.get('doc_id')}"}
 
 @app.post("/ask")
 async def ask(request: AskRequest):
@@ -236,3 +250,31 @@ async def ask(request: AskRequest):
         }
 
     return resp
+
+# ==========================
+# BACKGROUND LISTENER
+# ==========================
+
+async def handle_ingest(conn, pid, channel, payload):
+    print(f"📥 Received notification: {payload}")
+    try:
+        data = json.loads(payload)
+        await run_ingestion(
+            doc_id=data.get("doc_id"),
+            org_id=data.get("org_id"),
+            storage_path=data.get("storage_path"),
+            file_type=data.get("file_type")
+        )
+    except Exception as e:
+        print(f"❌ Error handling notification: {e}")
+
+async def listen_for_ingest():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.add_listener("ingest_channel", handle_ingest)
+    print("📡 Listening for ingest_channel notifications...")
+    while True:
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(listen_for_ingest())
