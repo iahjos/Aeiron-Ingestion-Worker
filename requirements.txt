@@ -8,3 +8,4 @@ pandas        # for CSV parsing
 python-dotenv
 python-multipart
 requests
+asyncpg
