@@ -25,7 +25,7 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-DATABASE_URL = os.getenv("SUPABASE_DB_URL")  # Full Postgres URL from Supabase
+DATABASE_URL = os.getenv("DATABASE_URL")  # Full Postgres URL from Supabase
 
 if not DATABASE_URL:
     raise RuntimeError("❌ SUPABASE_DB_URL not set in environment")
