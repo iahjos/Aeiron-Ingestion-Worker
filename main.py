@@ -25,7 +25,10 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-DATABASE_URL = os.getenv("SUPABASE_DB_URL")  # Full Postgres URL (from Supabase settings)
+DATABASE_URL = os.getenv("SUPABASE_DB_URL")  # Full Postgres URL from Supabase
+
+if not DATABASE_URL:
+    raise RuntimeError("❌ SUPABASE_DB_URL not set in environment")
 
 # ==========================
 # MODELS
@@ -93,12 +96,12 @@ def summarize_chunks_for_context(rows):
     return "\n\n".join(r.get("content", "") for r in rows if r.get("content"))
 
 # ==========================
-# INGESTION CORE LOGIC (reusable)
+# INGESTION CORE LOGIC
 # ==========================
 
 async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
     try:
-        # Decide how to fetch file
+        # Fetch file
         if file_url:
             resp = requests.get(file_url)
             resp.raise_for_status()
@@ -131,7 +134,7 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
         chunk_size = 500
         chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-        # Embed + insert
+        # Embed + insert into Supabase
         for idx, chunk in enumerate(chunks):
             emb = openai.embeddings.create(
                 model="text-embedding-3-small",
@@ -181,7 +184,7 @@ async def ingest_file(payload: dict):
     await run_ingestion(
         doc_id=payload.get("doc_id"),
         org_id=payload.get("org_id"),
-        storage_path=payload.get("file_path"),
+        storage_path=payload.get("storage_path"),  # ✅ FIXED
         file_type=payload.get("file_type"),
         file_url=payload.get("file_url")
     )
@@ -216,8 +219,8 @@ async def ask(request: AskRequest):
         f"Context (company docs):\n{context_text if context_text else '(no relevant context retrieved)'}\n\n"
         "Instructions:\n"
         "- If using only the context, answer directly and concisely.\n"
-        "- If providing an estimate (allowed in this turn), clearly label it as 'Estimate', add brief 'Assumptions', "
-        "and an 'Uncertainty' level."
+        "- If providing an estimate (allowed in this turn), clearly label it as 'Estimate', "
+        "add brief 'Assumptions', and an 'Uncertainty' level."
     )
 
     completion = openai.chat.completions.create(
@@ -269,11 +272,16 @@ async def handle_ingest(conn, pid, channel, payload):
         print(f"❌ Error handling notification: {e}")
 
 async def listen_for_ingest():
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.add_listener("ingest_channel", handle_ingest)
-    print("📡 Listening for ingest_channel notifications...")
     while True:
-        await asyncio.sleep(60)
+        try:
+            conn = await asyncpg.connect(DATABASE_URL)
+            await conn.add_listener("ingest_channel", handle_ingest)
+            print("📡 Listening for ingest_channel notifications...")
+            while True:
+                await asyncio.sleep(60)
+        except Exception as e:
+            print(f"❌ Listener error: {e}, retrying in 5s...")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup():
