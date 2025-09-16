@@ -255,7 +255,7 @@ async def ask(request: AskRequest):
     return resp
 
 # ==========================
-# BACKGROUND LISTENER
+# BACKGROUND LISTENER (FIXED)
 # ==========================
 
 async def handle_ingest(conn, pid, channel, payload):
@@ -276,23 +276,27 @@ async def handle_ingest(conn, pid, channel, payload):
     except Exception as e:
         print(f"❌ Error handling notification: {e}")
 
+
+def ingest_listener(conn, pid, channel, payload):
+    """Wrapper so asyncpg can call an async handler."""
+    asyncio.create_task(handle_ingest(conn, pid, channel, payload))
+
+
 async def listen_for_ingest():
     try:
         conn = await asyncpg.connect(
             DATABASE_URL,
-            statement_cache_size=0  # ✅ disable prepared statements for pgbouncer
+            statement_cache_size=0
         )
-        await conn.add_listener("ingest_channel", handle_ingest)
+        await conn.add_listener("ingest_channel", ingest_listener)
         print("📡 Listening for ingest_channel notifications...")
 
-        # keep the connection alive
         while True:
             await asyncio.sleep(60)
-
     except Exception as e:
         print(f"❌ Listener error: {e}, retrying in 5s...")
         await asyncio.sleep(5)
-        asyncio.create_task(listen_for_ingest())  # retry loop
+        asyncio.create_task(listen_for_ingest())
 
 @app.on_event("startup")
 async def startup():
