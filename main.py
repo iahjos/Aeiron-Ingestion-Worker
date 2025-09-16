@@ -259,9 +259,14 @@ async def ask(request: AskRequest):
 # ==========================
 
 async def handle_ingest(conn, pid, channel, payload):
-    print(f"📥 Received notification: {payload}")
+    print("📥 Raw notification received!")
+    print(f"Channel: {channel}, PID: {pid}")
+    print(f"Payload string: {payload}")
+
     try:
         data = json.loads(payload)
+        print(f"📦 Parsed payload: {data}")
+
         await run_ingestion(
             doc_id=data.get("doc_id"),
             org_id=data.get("org_id"),
