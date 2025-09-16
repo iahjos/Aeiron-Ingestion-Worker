@@ -272,16 +272,22 @@ async def handle_ingest(conn, pid, channel, payload):
         print(f"❌ Error handling notification: {e}")
 
 async def listen_for_ingest():
-    while True:
-        try:
-            conn = await asyncpg.connect(DATABASE_URL)
-            await conn.add_listener("ingest_channel", handle_ingest)
-            print("📡 Listening for ingest_channel notifications...")
-            while True:
-                await asyncio.sleep(60)
-        except Exception as e:
-            print(f"❌ Listener error: {e}, retrying in 5s...")
-            await asyncio.sleep(5)
+    try:
+        conn = await asyncpg.connect(
+            DATABASE_URL,
+            statement_cache_size=0  # ✅ disable prepared statements for pgbouncer
+        )
+        await conn.add_listener("ingest_channel", handle_ingest)
+        print("📡 Listening for ingest_channel notifications...")
+
+        # keep the connection alive
+        while True:
+            await asyncio.sleep(60)
+
+    except Exception as e:
+        print(f"❌ Listener error: {e}, retrying in 5s...")
+        await asyncio.sleep(5)
+        asyncio.create_task(listen_for_ingest())  # retry loop
 
 @app.on_event("startup")
 async def startup():
