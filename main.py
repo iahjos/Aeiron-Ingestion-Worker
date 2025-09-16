@@ -285,10 +285,6 @@ async def listen_for_ingest():
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(listen_for_ingest())
-
-@app.on_event("startup")
-async def startup():
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         print("✅ Database connection successful!")
@@ -296,4 +292,6 @@ async def startup():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
 
+    # Always start the listener, even if the test connection failed
     asyncio.create_task(listen_for_ingest())
+
