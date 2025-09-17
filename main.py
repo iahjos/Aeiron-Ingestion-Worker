@@ -11,29 +11,30 @@ import requests
 import asyncio
 import asyncpg
 import json
-from dotenv import load_dotenv
 
-# ==========================
-# ENV + INIT
-# ==========================
+# Load environment variables
+from dotenv import load_dotenv
 load_dotenv()
 
+# Initialize FastAPI
 app = FastAPI()
 
+# Initialize Supabase client
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 
-# ✅ Use the POOLER connection string
-DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
+# ✅ Use DIRECT connection (port 5432)
+DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")  # example: postgresql://postgres:password@db.xxxxxx.supabase.co:5432/postgres
 
 if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL_POOLER not set in environment")
+    raise RuntimeError("❌ DATABASE_URL_DIRECT not set in environment")
 
 # ==========================
 # MODELS
 # ==========================
+
 class AskRequest(BaseModel):
     org_id: str
     question: str
@@ -45,6 +46,7 @@ class AskRequest(BaseModel):
 # ==========================
 # HELPERS
 # ==========================
+
 def extract_text_from_pdf(file_path):
     text = ""
     with fitz.open(file_path) as doc:
@@ -95,10 +97,12 @@ def summarize_chunks_for_context(rows):
     return "\n\n".join(r.get("content", "") for r in rows if r.get("content"))
 
 # ==========================
-# INGESTION CORE
+# INGESTION CORE LOGIC
 # ==========================
+
 async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
     try:
+        # Fetch file
         if file_url:
             resp = requests.get(file_url)
             resp.raise_for_status()
@@ -113,6 +117,7 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
             with open(tmp_path, "wb") as f:
                 f.write(resp.content)
 
+        # Extract text
         if tmp_path.endswith(".pdf"):
             text = extract_text_from_pdf(tmp_path)
         elif tmp_path.endswith(".docx"):
@@ -126,9 +131,11 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
             print(f"❌ No text extracted for {doc_id}")
             return
 
+        # Split into chunks
         chunk_size = 500
         chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
+        # Embed + insert into Supabase
         for idx, chunk in enumerate(chunks):
             emb = openai.embeddings.create(
                 model="text-embedding-3-small",
@@ -151,6 +158,7 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
 # ==========================
 # ROUTES
 # ==========================
+
 @app.get("/")
 def root():
     return {"message": "Ingestion worker + RAG API is running."}
@@ -227,7 +235,10 @@ async def ask(request: AskRequest):
 
     answer = completion.choices[0].message.content
 
-    resp = {"answer": answer, "mode_used": "blend" if allow_general else "strict"}
+    resp = {
+        "answer": answer,
+        "mode_used": "blend" if allow_general else "strict",
+    }
     if request.debug:
         resp["retrieval"] = [
             {
@@ -241,11 +252,13 @@ async def ask(request: AskRequest):
             "match_threshold": request.match_threshold,
             "match_count": request.match_count
         }
+
     return resp
 
 # ==========================
 # BACKGROUND LISTENER
 # ==========================
+
 async def handle_ingest(conn, pid, channel, payload):
     print("📥 Raw notification received!")
     print(f"Channel: {channel}, PID: {pid}")
@@ -269,10 +282,7 @@ def ingest_listener(conn, pid, channel, payload):
 
 async def listen_for_ingest():
     try:
-        conn = await asyncpg.connect(
-            DATABASE_URL,
-            statement_cache_size=0  # ✅ required for PgBouncer
-        )
+        conn = await asyncpg.connect(DATABASE_URL)
         await conn.add_listener("ingest_channel", ingest_listener)
         print("📡 Listening for ingest_channel notifications...")
 
@@ -286,7 +296,7 @@ async def listen_for_ingest():
 @app.on_event("startup")
 async def startup():
     try:
-        conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
+        conn = await asyncpg.connect(DATABASE_URL)
         print("✅ Database connection successful!")
         await conn.close()
     except Exception as e:
