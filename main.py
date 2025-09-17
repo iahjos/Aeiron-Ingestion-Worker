@@ -11,24 +11,27 @@ import requests
 import asyncio
 import asyncpg
 import json
-
-# Load environment variables
 from dotenv import load_dotenv
+
+# ==========================
+# ENV + APP INIT
+# ==========================
+
 load_dotenv()
 
-# Initialize FastAPI
 app = FastAPI()
 
-# Initialize Supabase client
+# Supabase client
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Full Postgres URL from Supabase
+# Direct connection (NOT pooled)
+DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")
 
 if not DATABASE_URL:
-    raise RuntimeError("❌ SUPABASE_DB_URL not set in environment")
+    raise RuntimeError("❌ DATABASE_URL_DIRECT not set in environment")
 
 # ==========================
 # MODELS
@@ -96,7 +99,7 @@ def summarize_chunks_for_context(rows):
     return "\n\n".join(r.get("content", "") for r in rows if r.get("content"))
 
 # ==========================
-# INGESTION CORE LOGIC
+# INGESTION CORE
 # ==========================
 
 async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
@@ -184,7 +187,7 @@ async def ingest_file(payload: dict):
     await run_ingestion(
         doc_id=payload.get("doc_id"),
         org_id=payload.get("org_id"),
-        storage_path=payload.get("storage_path"),  # ✅ FIXED
+        storage_path=payload.get("storage_path"),
         file_type=payload.get("file_type"),
         file_url=payload.get("file_url")
     )
@@ -255,7 +258,7 @@ async def ask(request: AskRequest):
     return resp
 
 # ==========================
-# BACKGROUND LISTENER (FIXED)
+# BACKGROUND LISTENER
 # ==========================
 
 async def handle_ingest(conn, pid, channel, payload):
@@ -276,11 +279,8 @@ async def handle_ingest(conn, pid, channel, payload):
     except Exception as e:
         print(f"❌ Error handling notification: {e}")
 
-
 def ingest_listener(conn, pid, channel, payload):
-    """Wrapper so asyncpg can call an async handler."""
     asyncio.create_task(handle_ingest(conn, pid, channel, payload))
-
 
 async def listen_for_ingest():
     try:
@@ -307,6 +307,4 @@ async def startup():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
 
-    # Always start the listener, even if the test connection failed
     asyncio.create_task(listen_for_ingest())
-
