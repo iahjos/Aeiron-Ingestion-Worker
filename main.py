@@ -25,11 +25,10 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# ✅ Use DIRECT connection (port 5432)
-DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")  # example: postgresql://postgres:password@db.xxxx.supabase.co:5432/postgres
-
+# ✅ Use DIRECT connection (port 5432) for LISTEN/NOTIFY
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL_DIRECT not set in environment")
+    raise RuntimeError("❌ DATABASE_URL not set in environment")
 
 # ==========================
 # MODELS
@@ -306,8 +305,6 @@ async def startup():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
 
-    # Properly schedule the listener
     loop = asyncio.get_event_loop()
     loop.create_task(listen_for_ingest())
     print("📡 Ingestion listener started")
-
