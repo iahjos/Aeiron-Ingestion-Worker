@@ -11,9 +11,9 @@ import requests
 import asyncio
 import asyncpg
 import json
+from dotenv import load_dotenv
 
 # Load environment variables
-from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize FastAPI
@@ -25,7 +25,7 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# ✅ Use DIRECT connection (port 5432) for LISTEN/NOTIFY
+# ✅ Use DIRECT connection (port 5432)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL not set in environment")
@@ -33,7 +33,6 @@ if not DATABASE_URL:
 # ==========================
 # MODELS
 # ==========================
-
 class AskRequest(BaseModel):
     org_id: str
     question: str
@@ -45,7 +44,6 @@ class AskRequest(BaseModel):
 # ==========================
 # HELPERS
 # ==========================
-
 def extract_text_from_pdf(file_path):
     text = ""
     with fitz.open(file_path) as doc:
@@ -98,9 +96,10 @@ def summarize_chunks_for_context(rows):
 # ==========================
 # INGESTION CORE LOGIC
 # ==========================
-
 async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
     try:
+        print(f"🚀 Starting ingestion for {doc_id} ({file_type})")
+
         # Fetch file
         if file_url:
             resp = requests.get(file_url)
@@ -142,13 +141,15 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
             )
             embedding = emb.data[0].embedding
 
-            supabase.table("doc_chunks").insert({
+            result = supabase.table("doc_chunks").insert({
                 "doc_id": doc_id,
                 "org_id": org_id,
                 "chunk_index": idx,
                 "content": chunk,
                 "embedding": embedding
             }).execute()
+
+            print(f"🔎 Insert result for chunk {idx}: {result}")
 
         print(f"✅ Ingested {len(chunks)} chunks for {doc_id}")
     except Exception as e:
@@ -157,7 +158,6 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
 # ==========================
 # ROUTES
 # ==========================
-
 @app.get("/")
 def root():
     return {"message": "Ingestion worker + RAG API is running."}
@@ -259,37 +259,13 @@ async def ask(request: AskRequest):
     return resp
 
 # ==========================
-# BACKGROUND LISTENER
+# QUEUE WORKER
 # ==========================
-
-async def handle_ingest(conn, pid, channel, payload):
-    print("📥 Raw notification received!")
-    print(f"Channel: {channel}, PID: {pid}")
-    print(f"Payload string: {payload}")
-
-    try:
-        data = json.loads(payload)
-        print(f"📦 Parsed payload: {data}")
-
-        await run_ingestion(
-            doc_id=data.get("doc_id"),
-            org_id=data.get("org_id"),
-            storage_path=data.get("storage_path"),
-            file_type=data.get("file_type")
-        )
-    except Exception as e:
-        print(f"❌ Error handling notification: {e}")
-
-def ingest_listener(conn, pid, channel, payload):
-    asyncio.create_task(handle_ingest(conn, pid, channel, payload))
-
 async def process_queue():
     while True:
-        conn = None
         try:
             conn = await asyncpg.connect(DATABASE_URL)
-
-            row = await conn.fetchrow("""
+            rows = await conn.fetch("""
                 update ingestion_queue
                 set status = 'processing', updated_at = now()
                 where id = (
@@ -302,8 +278,8 @@ async def process_queue():
                 returning *;
             """)
 
-            if row:
-                job = dict(row)
+            if rows:
+                job = dict(rows[0])
                 print(f"📥 Picked up job: {job['id']} for doc {job['doc_id']}")
 
                 try:
@@ -325,16 +301,12 @@ async def process_queue():
                     )
                     print(f"❌ Job {job['id']} failed: {e}")
             else:
-                # No jobs right now → wait
                 await asyncio.sleep(5)
 
+            await conn.close()
         except Exception as e:
             print(f"❌ Queue processor error: {e}, retrying in 5s...")
             await asyncio.sleep(5)
-
-        finally:
-            if conn:
-                await conn.close()
 
 @app.on_event("startup")
 async def startup():
