@@ -285,9 +285,11 @@ def ingest_listener(conn, pid, channel, payload):
 
 async def process_queue():
     while True:
+        conn = None
         try:
             conn = await asyncpg.connect(DATABASE_URL)
-            rows = await conn.fetch("""
+
+            row = await conn.fetchrow("""
                 update ingestion_queue
                 set status = 'processing', updated_at = now()
                 where id = (
@@ -300,8 +302,8 @@ async def process_queue():
                 returning *;
             """)
 
-            if rows:
-                job = dict(rows[0])
+            if row:
+                job = dict(row)
                 print(f"📥 Picked up job: {job['id']} for doc {job['doc_id']}")
 
                 try:
@@ -323,13 +325,16 @@ async def process_queue():
                     )
                     print(f"❌ Job {job['id']} failed: {e}")
             else:
-                # No jobs, sleep a bit
+                # No jobs right now → wait
                 await asyncio.sleep(5)
 
-            await conn.close()
         except Exception as e:
             print(f"❌ Queue processor error: {e}, retrying in 5s...")
             await asyncio.sleep(5)
+
+        finally:
+            if conn:
+                await conn.close()
 
 @app.on_event("startup")
 async def startup():
@@ -337,4 +342,3 @@ async def startup():
     loop = asyncio.get_event_loop()
     loop.create_task(process_queue())
     print("📡 Queue processor started")
-
