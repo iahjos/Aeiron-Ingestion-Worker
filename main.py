@@ -26,7 +26,7 @@ supabase = create_client(
 )
 
 # ✅ Use DIRECT connection (port 5432)
-DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")  # example: postgresql://postgres:password@db.xxxxxx.supabase.co:5432/postgres
+DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")  # example: postgresql://postgres:password@db.xxxx.supabase.co:5432/postgres
 
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL_DIRECT not set in environment")
@@ -163,6 +163,10 @@ async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
 def root():
     return {"message": "Ingestion worker + RAG API is running."}
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/upload")
 async def upload_file(file: UploadFile, org_id: str = Form(...)):
     file_location = f"/tmp/{file.filename}"
@@ -281,23 +285,23 @@ def ingest_listener(conn, pid, channel, payload):
     asyncio.create_task(handle_ingest(conn, pid, channel, payload))
 
 async def listen_for_ingest():
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.add_listener("ingest_channel", ingest_listener)
-        print("📡 Listening for ingest_channel notifications...")
+    while True:
+        try:
+            conn = await asyncpg.connect(DATABASE_URL)
+            await conn.add_listener("ingest_channel", ingest_listener)
+            print("📡 Listening for ingest_channel notifications...")
 
-        while True:
-            await asyncio.sleep(60)
-    except Exception as e:
-        print(f"❌ Listener error: {e}, retrying in 5s...")
-        await asyncio.sleep(5)
-        asyncio.create_task(listen_for_ingest())
+            while True:
+                await asyncio.sleep(60)
+        except Exception as e:
+            print(f"❌ Listener error: {e}, retrying in 5s...")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup():
     try:
         conn = await asyncpg.connect(DATABASE_URL)
-        print("✅ Database connection successful!")
+        print(f"✅ Database connection successful! Using {DATABASE_URL}")
         await conn.close()
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
