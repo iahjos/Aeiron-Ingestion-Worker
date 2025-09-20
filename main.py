@@ -292,6 +292,7 @@ async def listen_for_ingest():
 
             while True:
                 await asyncio.sleep(60)
+
         except Exception as e:
             print(f"❌ Listener error: {e}, retrying in 5s...")
             await asyncio.sleep(5)
@@ -305,6 +306,5 @@ async def startup():
     except Exception as e:
         print(f"❌ Database connection failed: {e}")
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(listen_for_ingest())
+    asyncio.create_task(listen_for_ingest())
     print("📡 Ingestion listener started")
