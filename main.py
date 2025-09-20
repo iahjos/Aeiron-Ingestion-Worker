@@ -283,28 +283,58 @@ async def handle_ingest(conn, pid, channel, payload):
 def ingest_listener(conn, pid, channel, payload):
     asyncio.create_task(handle_ingest(conn, pid, channel, payload))
 
-async def listen_for_ingest():
+async def process_queue():
     while True:
         try:
             conn = await asyncpg.connect(DATABASE_URL)
-            await conn.add_listener("ingest_channel", ingest_listener)
-            print("📡 Listening for ingest_channel notifications...")
+            rows = await conn.fetch("""
+                update ingestion_queue
+                set status = 'processing', updated_at = now()
+                where id = (
+                    select id from ingestion_queue
+                    where status = 'pending'
+                    order by created_at
+                    for update skip locked
+                    limit 1
+                )
+                returning *;
+            """)
 
-            while True:
-                await asyncio.sleep(60)
+            if rows:
+                job = dict(rows[0])
+                print(f"📥 Picked up job: {job['id']} for doc {job['doc_id']}")
 
+                try:
+                    await run_ingestion(
+                        doc_id=job["doc_id"],
+                        org_id=job["org_id"],
+                        storage_path=job["storage_path"],
+                        file_type=job["file_type"],
+                    )
+                    await conn.execute(
+                        "update ingestion_queue set status='done', updated_at=now() where id=$1",
+                        job["id"],
+                    )
+                    print(f"✅ Job {job['id']} completed")
+                except Exception as e:
+                    await conn.execute(
+                        "update ingestion_queue set status='failed', error=$2, updated_at=now() where id=$1",
+                        job["id"], str(e),
+                    )
+                    print(f"❌ Job {job['id']} failed: {e}")
+            else:
+                # No jobs, sleep a bit
+                await asyncio.sleep(5)
+
+            await conn.close()
         except Exception as e:
-            print(f"❌ Listener error: {e}, retrying in 5s...")
+            print(f"❌ Queue processor error: {e}, retrying in 5s...")
             await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup():
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        print(f"✅ Database connection successful! Using {DATABASE_URL}")
-        await conn.close()
-    except Exception as e:
-        print(f"❌ Database connection failed: {e}")
+    print("🚀 Worker starting up...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(process_queue())
+    print("📡 Queue processor started")
 
-    asyncio.create_task(listen_for_ingest())
-    print("📡 Ingestion listener started")
