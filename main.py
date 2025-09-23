@@ -216,7 +216,7 @@ async def process_queue_forever():
         while True:
             rows = await conn.fetch("""
                 select * from ingestion_queue
-                where status in ('queued','retry')
+                where status in ('pending','retry')
                 order by created_at asc
                 limit 1
             """)
