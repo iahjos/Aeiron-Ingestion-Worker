@@ -33,6 +33,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Pick database URL (pooler preferred, fallback to direct)
 if os.getenv("DATABASE_URL_POOLER"):
     DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
     print("📡 Using DATABASE_URL_POOLER (pgbouncer, port 6543)")
@@ -42,6 +43,7 @@ elif os.getenv("DATABASE_URL_DIRECT"):
 else:
     raise RuntimeError("❌ No database URL found. Please set DATABASE_URL_POOLER or DATABASE_URL_DIRECT.")
 
+# Fail fast if critical vars are missing
 missing = [k for k,v in [
     ("SUPABASE_URL", SUPABASE_URL),
     ("SUPABASE_KEY", SUPABASE_KEY),
@@ -50,6 +52,7 @@ missing = [k for k,v in [
 if missing:
     raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
+# Init Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
 
@@ -65,11 +68,14 @@ def chunk_text(txt: str, chunk_size: int = 1200, overlap: int = 200) -> List[str
     txt = (txt or "").strip()
     if not txt:
         return []
-    chunks, start, n = [], 0, len(txt)
+    chunks = []
+    start = 0
+    n = len(txt)
     while start < n:
         end = min(start + chunk_size, n)
         chunks.append(txt[start:end])
-        if end == n: break
+        if end == n:
+            break
         start = max(0, end - overlap)
     return chunks
 
@@ -125,15 +131,19 @@ async def download_to_temp(bucket: str, path: str) -> str:
     tmp.close()
     return tmp.name
 
-async def insert_chunks(conn, doc_id: str, chunks: List[str]) -> int:
+async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> int:
     if not chunks:
         return 0
     embeddings = embed_texts(chunks)
     sql = """
-        insert into doc_chunks (doc_id, chunk_index, content, embedding)
-        values ($1, $2, $3, $4)
+        insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding, created_at)
+        values ($1, $2, $3, $4, $5, now())
     """
-    rows = [(doc_id, i, chunks[i], embeddings[i]) for i in range(len(chunks))]
+    rows = []
+    for i, chunk in enumerate(chunks):
+        emb = embeddings[i]
+        emb = list(map(float, emb))  # flatten into Python list of floats
+        rows.append((org_id, doc_id, i, chunk, emb))
     await conn.executemany(sql, rows)
     return len(rows)
 
@@ -144,13 +154,14 @@ async def process_one_job(conn, job: dict):
     bucket     = job["bucket"]
     path       = job["path"]
     mime_type  = job.get("file_type") or ""
+    extension  = os.path.splitext(path)[1]
 
     print(f"\n▶️  Processing job {job_id} (org={org_id}, doc={doc_id})")
     await conn.execute("update ingestion_queue set status='processing', error=null where id=$1", job_id)
 
     local_path = await download_to_temp(bucket, path)
 
-    which = guess_extractor(mime_type, path)
+    which = guess_extractor(mime_type, extension)
     try:
         if which == "pdf":
             text = extract_text_from_pdf(local_path)
@@ -159,7 +170,7 @@ async def process_one_job(conn, job: dict):
         elif which == "csv":
             text = extract_text_from_csv(local_path)
         else:
-            raise RuntimeError(f"Unsupported file type: mime={mime_type} path={path}")
+            raise RuntimeError(f"Unsupported file type: mime={mime_type} ext={extension}")
     except Exception as e:
         await conn.execute(
             "update ingestion_queue set status='failed', error=$2 where id=$1",
@@ -188,7 +199,7 @@ async def process_one_job(conn, job: dict):
         return
 
     try:
-        inserted = await insert_chunks(conn, doc_id, chunks)
+        inserted = await insert_chunks(conn, org_id, doc_id, chunks)
         print(f"✅ Inserted chunks: {inserted}")
     except Exception as e:
         await conn.execute(
@@ -203,7 +214,7 @@ async def process_one_job(conn, job: dict):
 
 async def process_queue_forever():
     print("📡 Queue processor loop starting...")
-    conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)  # 👈 FIX
+    conn = await asyncpg.connect(DATABASE_URL)
     print("✅ Connected to database")
     try:
         while True:
