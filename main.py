@@ -136,14 +136,12 @@ async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> in
         return 0
     embeddings = embed_texts(chunks)
     sql = """
-        insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding, created_at)
-        values ($1, $2, $3, $4, $5, now())
+        insert into doc_chunks (doc_id, content, embedding, chunk_index, created_at)
+        values ($1, $2, $3, $4, now())
     """
-    rows = []
-    for i, chunk in enumerate(chunks):
-        emb = embeddings[i]
-        emb = list(map(float, emb))  # flatten into Python list of floats
-        rows.append((org_id, doc_id, i, chunk, emb))
+    rows = [(doc_id, chunks[i], embeddings[i], i) for i in range(len(chunks))]
+    # Ensure embeddings[i] is cast to list of floats
+    rows = [(doc_id, chunks[i], list(map(float, embeddings[i])), i) for i in range(len(chunks))]
     await conn.executemany(sql, rows)
     return len(rows)
 
