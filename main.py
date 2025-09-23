@@ -137,11 +137,13 @@ async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> in
     embeddings = embed_texts(chunks)
     sql = """
         insert into doc_chunks (doc_id, content, embedding, chunk_index, created_at)
-        values ($1, $2, $3, $4, now())
+        values ($1, $2, $3::vector, $4, now())
     """
-    rows = [(doc_id, chunks[i], embeddings[i], i) for i in range(len(chunks))]
-    # Ensure embeddings[i] is cast to list of floats
-    rows = [(doc_id, chunks[i], list(map(float, embeddings[i])), i) for i in range(len(chunks))]
+    # Convert each embedding to a space-separated string
+    rows = [
+        (doc_id, chunks[i], " ".join(map(str, embeddings[i])), i)
+        for i in range(len(chunks))
+    ]
     await conn.executemany(sql, rows)
     return len(rows)
 
