@@ -125,15 +125,15 @@ async def download_to_temp(bucket: str, path: str) -> str:
     tmp.close()
     return tmp.name
 
-async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> int:
+async def insert_chunks(conn, doc_id: str, chunks: List[str]) -> int:
     if not chunks:
         return 0
     embeddings = embed_texts(chunks)
     sql = """
-        insert into doc_chunks (doc_id, content, embedding, chunk_index, created_at)
-        values ($1, $2, $3, $4, now())
+        insert into doc_chunks (doc_id, chunk_index, content, embedding)
+        values ($1, $2, $3, $4)
     """
-    rows = [(doc_id, chunks[i], embeddings[i], i) for i in range(len(chunks))]
+    rows = [(doc_id, i, chunks[i], embeddings[i]) for i in range(len(chunks))]
     await conn.executemany(sql, rows)
     return len(rows)
 
@@ -188,7 +188,7 @@ async def process_one_job(conn, job: dict):
         return
 
     try:
-        inserted = await insert_chunks(conn, org_id, doc_id, chunks)
+        inserted = await insert_chunks(conn, doc_id, chunks)
         print(f"✅ Inserted chunks: {inserted}")
     except Exception as e:
         await conn.execute(
