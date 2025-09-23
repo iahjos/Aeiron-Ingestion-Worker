@@ -33,7 +33,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Pick database URL (pooler preferred, fallback to direct)
 if os.getenv("DATABASE_URL_POOLER"):
     DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
     print("📡 Using DATABASE_URL_POOLER (pgbouncer, port 6543)")
@@ -43,7 +42,6 @@ elif os.getenv("DATABASE_URL_DIRECT"):
 else:
     raise RuntimeError("❌ No database URL found. Please set DATABASE_URL_POOLER or DATABASE_URL_DIRECT.")
 
-# Fail fast if critical vars are missing
 missing = [k for k,v in [
     ("SUPABASE_URL", SUPABASE_URL),
     ("SUPABASE_KEY", SUPABASE_KEY),
@@ -52,7 +50,6 @@ missing = [k for k,v in [
 if missing:
     raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-# Init Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
 
@@ -68,14 +65,11 @@ def chunk_text(txt: str, chunk_size: int = 1200, overlap: int = 200) -> List[str
     txt = (txt or "").strip()
     if not txt:
         return []
-    chunks = []
-    start = 0
-    n = len(txt)
+    chunks, start, n = [], 0, len(txt)
     while start < n:
         end = min(start + chunk_size, n)
         chunks.append(txt[start:end])
-        if end == n:
-            break
+        if end == n: break
         start = max(0, end - overlap)
     return chunks
 
@@ -136,10 +130,10 @@ async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> in
         return 0
     embeddings = embed_texts(chunks)
     sql = """
-        insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
-        values ($1, $2, $3, $4, $5)
+        insert into doc_chunks (doc_id, content, embedding, chunk_index, created_at)
+        values ($1, $2, $3, $4, now())
     """
-    rows = [(org_id, doc_id, i, chunks[i], embeddings[i]) for i in range(len(chunks))]
+    rows = [(doc_id, chunks[i], embeddings[i], i) for i in range(len(chunks))]
     await conn.executemany(sql, rows)
     return len(rows)
 
@@ -149,15 +143,14 @@ async def process_one_job(conn, job: dict):
     doc_id     = job["doc_id"]
     bucket     = job["bucket"]
     path       = job["path"]
-    mime_type  = job.get("mime_type") or ""
-    extension  = job.get("extension") or ""
+    mime_type  = job.get("file_type") or ""
 
     print(f"\n▶️  Processing job {job_id} (org={org_id}, doc={doc_id})")
     await conn.execute("update ingestion_queue set status='processing', error=null where id=$1", job_id)
 
     local_path = await download_to_temp(bucket, path)
 
-    which = guess_extractor(mime_type, extension)
+    which = guess_extractor(mime_type, path)
     try:
         if which == "pdf":
             text = extract_text_from_pdf(local_path)
@@ -166,7 +159,7 @@ async def process_one_job(conn, job: dict):
         elif which == "csv":
             text = extract_text_from_csv(local_path)
         else:
-            raise RuntimeError(f"Unsupported file type: mime={mime_type} ext={extension}")
+            raise RuntimeError(f"Unsupported file type: mime={mime_type} path={path}")
     except Exception as e:
         await conn.execute(
             "update ingestion_queue set status='failed', error=$2 where id=$1",
@@ -216,7 +209,7 @@ async def process_queue_forever():
         while True:
             rows = await conn.fetch("""
                 select * from ingestion_queue
-                where status in ('pending','retry')
+                where status in ('queued','retry')
                 order by created_at asc
                 limit 1
             """)
