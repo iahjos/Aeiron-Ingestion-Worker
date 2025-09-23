@@ -3,12 +3,10 @@ import io
 import json
 import asyncio
 import tempfile
-from typing import List, Dict, Optional
+from typing import List
 
 from fastapi import FastAPI
-from pydantic import BaseModel
 from dotenv import load_dotenv
-
 import asyncpg
 import pandas as pd
 import fitz              # PyMuPDF for PDFs
@@ -20,49 +18,46 @@ try:
     from openai import OpenAI
     _openai_client = OpenAI()
     def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
-        # batch once to keep it simple; could batch in chunks of 100+ if needed
         resp = _openai_client.embeddings.create(model=model, input=texts)
         return [d.embedding for d in resp.data]
-except Exception as e:
-    # If the new SDK isn't available, fall back to the legacy import for dev
+except Exception:
     import openai as _openai_legacy
     def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
         resp = _openai_legacy.Embedding.create(model=model, input=texts)
         return [d["embedding"] for d in resp["data"]]
 
 # ------------ Load env early ------------
-load_dotenv()  # IMPORTANT: make sure .env is read when running in Docker
+load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-DATABASE_URL  = os.getenv("DATABASE_URL_POOLER") or os.getenv("DATABASE_URL_DIRECT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Fail fast if any are missing
+# Pick database URL (pooler preferred, fallback to direct)
+if os.getenv("DATABASE_URL_POOLER"):
+    DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
+    print("📡 Using DATABASE_URL_POOLER (pgbouncer, port 6543)")
+elif os.getenv("DATABASE_URL_DIRECT"):
+    DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")
+    print("📡 Using DATABASE_URL_DIRECT (direct, port 5432)")
+else:
+    raise RuntimeError("❌ No database URL found. Please set DATABASE_URL_POOLER or DATABASE_URL_DIRECT.")
+
+# Fail fast if critical vars are missing
 missing = [k for k,v in [
     ("SUPABASE_URL", SUPABASE_URL),
     ("SUPABASE_KEY", SUPABASE_KEY),
-    ("DATABASE_URL_POOLER or DATABASE_URL_DIRECT", DATABASE_URL),
     ("OPENAI_API_KEY", OPENAI_API_KEY),
 ] if not v]
 if missing:
     raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-# legacy openai var needed if using legacy path above
-os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
-
+# Init Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
 
 # ---------- FastAPI ----------
 app = FastAPI(title="Aeiron Ingestion Worker")
-
-# --------- Models for /health & /ask (optional) ----------
-class AskRequest(BaseModel):
-    org_id: str
-    question: str
-    match_threshold: float = 0.3
-    match_count: int = 8
-    debug: bool = False
 
 @app.get("/health")
 def health():
@@ -86,19 +81,16 @@ def chunk_text(txt: str, chunk_size: int = 1200, overlap: int = 200) -> List[str
 
 def extract_text_from_pdf(file_path: str) -> str:
     doc = fitz.open(file_path)
-    pages = [page.get_text("text") for page in doc]
-    return "\n".join(pages).strip()
+    return "\n".join([p.get_text("text") for p in doc]).strip()
 
 def extract_text_from_docx(file_path: str) -> str:
     d = docx.Document(file_path)
     return "\n".join([p.text for p in d.paragraphs]).strip()
 
 def extract_text_from_csv(file_path: str) -> str:
-    # Robust CSV → text: join header + rows with CSV-like formatting
     try:
         df = pd.read_csv(file_path)
     except UnicodeDecodeError:
-        # try common encodings
         for enc in ("utf-8-sig","latin-1"):
             try:
                 df = pd.read_csv(file_path, encoding=enc)
@@ -109,7 +101,6 @@ def extract_text_from_csv(file_path: str) -> str:
             raise
     if df is None or df.empty:
         return ""
-    # Convert to a readable text table: header then rows
     lines = []
     lines.append(", ".join(map(str, df.columns.tolist())))
     for row in df.itertuples(index=False, name=None):
@@ -128,11 +119,8 @@ def guess_extractor(mime: str, ext: str):
     return "unknown"
 
 async def download_to_temp(bucket: str, path: str) -> str:
-    # Download using supabase storage and write to a temp file.
-    # NOTE: assumes the service key has access.
     print(f"📥 Downloading: bucket={bucket} path={path}")
     res = supabase.storage.from_(bucket).download(path)
-    # Some supabase clients return bytes directly; some return HTTPResponse-like objs.
     file_bytes = res if isinstance(res, (bytes, bytearray)) else getattr(res, "content", None)
     if not file_bytes:
         raise RuntimeError("Download returned empty bytes")
@@ -146,8 +134,7 @@ async def download_to_temp(bucket: str, path: str) -> str:
 async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> int:
     if not chunks:
         return 0
-    embeddings = embed_texts(chunks)  # list of vectors
-    # Insert with asyncpg executemany
+    embeddings = embed_texts(chunks)
     sql = """
         insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
         values ($1, $2, $3, $4, $5)
@@ -166,13 +153,10 @@ async def process_one_job(conn, job: dict):
     extension  = job.get("extension") or ""
 
     print(f"\n▶️  Processing job {job_id} (org={org_id}, doc={doc_id})")
-
     await conn.execute("update ingestion_queue set status='processing', error=null where id=$1", job_id)
 
-    # Download file to temp
     local_path = await download_to_temp(bucket, path)
 
-    # Extract text
     which = guess_extractor(mime_type, extension)
     try:
         if which == "pdf":
@@ -200,7 +184,6 @@ async def process_one_job(conn, job: dict):
         print("❌ Empty text; aborting.")
         return
 
-    # Chunk + embed + insert
     chunks = chunk_text(text)
     print(f"🪓 Chunk count: {len(chunks)}")
     if not chunks:
@@ -222,13 +205,13 @@ async def process_one_job(conn, job: dict):
         print(f"❌ Insert error: {e}")
         return
 
-    # Success
     await conn.execute("update ingestion_queue set status='done', error=null where id=$1", job_id)
     print("🎉 Job completed.")
 
 async def process_queue_forever():
     print("📡 Queue processor loop starting...")
     conn = await asyncpg.connect(DATABASE_URL)
+    print("✅ Connected to database")
     try:
         while True:
             rows = await conn.fetch("""
@@ -254,7 +237,6 @@ async def process_queue_forever():
                     )
                 except Exception:
                     pass
-            # small pause to avoid hot loop
             await asyncio.sleep(0.5)
     finally:
         await conn.close()
