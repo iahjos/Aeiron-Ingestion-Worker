@@ -218,6 +218,7 @@ async def process_queue_forever():
     print("✅ Connected to database")
     try:
         while True:
+            print("⏳ Polling ingestion_queue...")   # 👈 Add this line
             rows = await conn.fetch("""
                 select * from ingestion_queue
                 where status in ('queued','retry')
