@@ -214,7 +214,7 @@ async def process_one_job(conn, job: dict):
 
 async def process_queue_forever():
     print("📡 Queue processor loop starting...")
-    conn = await asyncpg.connect(DATABASE_URL)
+    conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
     print("✅ Connected to database")
     try:
         while True:
