@@ -34,14 +34,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Pick database URL (pooler preferred, fallback to direct)
-if os.getenv("DATABASE_URL_POOLER"):
-    DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
-    print("📡 Using DATABASE_URL_POOLER (pgbouncer, port 6543)")
-elif os.getenv("DATABASE_URL_DIRECT"):
+if os.getenv("DATABASE_URL_DIRECT"):
     DATABASE_URL = os.getenv("DATABASE_URL_DIRECT")
     print("📡 Using DATABASE_URL_DIRECT (direct, port 5432)")
+elif os.getenv("DATABASE_URL_POOLER"):
+    DATABASE_URL = os.getenv("DATABASE_URL_POOLER")
+    print("📡 Using DATABASE_URL_POOLER (pgbouncer, port 6543)")
 else:
-    raise RuntimeError("❌ No database URL found. Please set DATABASE_URL_POOLER or DATABASE_URL_DIRECT.")
+    raise RuntimeError("❌ No database URL found. Please set DATABASE_URL_DIRECT or DATABASE_URL_POOLER.")
 
 # Fail fast if critical vars are missing
 missing = [k for k,v in [
