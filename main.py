@@ -1,316 +1,266 @@
-from fastapi import FastAPI, UploadFile, Form
-from pydantic import BaseModel
-from supabase import create_client
-import openai
 import os
-import fitz  # PyMuPDF for PDFs
-import docx
-import pandas as pd
-import re
-import requests
-import asyncio
-import asyncpg
+import io
 import json
+import asyncio
+import tempfile
+from typing import List, Dict, Optional
+
+from fastapi import FastAPI
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+import asyncpg
+import pandas as pd
+import fitz              # PyMuPDF for PDFs
+import docx              # python-docx
+from supabase import create_client, Client
 
-# Initialize FastAPI
-app = FastAPI()
+# ---- OpenAI (new SDK) ----
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI()
+    def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+        # batch once to keep it simple; could batch in chunks of 100+ if needed
+        resp = _openai_client.embeddings.create(model=model, input=texts)
+        return [d.embedding for d in resp.data]
+except Exception as e:
+    # If the new SDK isn't available, fall back to the legacy import for dev
+    import openai as _openai_legacy
+    def embed_texts(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+        resp = _openai_legacy.Embedding.create(model=model, input=texts)
+        return [d["embedding"] for d in resp["data"]]
 
-# Initialize Supabase client
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+# ------------ Load env early ------------
+load_dotenv()  # IMPORTANT: make sure .env is read when running in Docker
 
-# ✅ Use DIRECT connection (port 5432)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ DATABASE_URL not set in environment")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+DATABASE_URL  = os.getenv("DATABASE_URL_POOLER") or os.getenv("DATABASE_URL_DIRECT")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ==========================
-# MODELS
-# ==========================
+# Fail fast if any are missing
+missing = [k for k,v in [
+    ("SUPABASE_URL", SUPABASE_URL),
+    ("SUPABASE_KEY", SUPABASE_KEY),
+    ("DATABASE_URL_POOLER or DATABASE_URL_DIRECT", DATABASE_URL),
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+] if not v]
+if missing:
+    raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+# legacy openai var needed if using legacy path above
+os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ---------- FastAPI ----------
+app = FastAPI(title="Aeiron Ingestion Worker")
+
+# --------- Models for /health & /ask (optional) ----------
 class AskRequest(BaseModel):
     org_id: str
     question: str
     match_threshold: float = 0.3
     match_count: int = 8
     debug: bool = False
-    mode: str = "blend"  # "strict" | "blend"
-
-# ==========================
-# HELPERS
-# ==========================
-def extract_text_from_pdf(file_path):
-    text = ""
-    with fitz.open(file_path) as doc:
-        for page in doc:
-            text += page.get_text()
-    return text
-
-def extract_text_from_docx(file_path):
-    doc = docx.Document(file_path)
-    return "\n".join([p.text for p in doc.paragraphs])
-
-def extract_text_from_csv(file_path):
-    df = pd.read_csv(file_path)
-    return df.to_string()
-
-def is_predictive(q: str) -> bool:
-    ql = q.lower()
-    patterns = [
-        r"\bnext year\b", r"\bupcoming\b", r"\bforecast\b", r"\bprojection\b",
-        r"\bproject(ed|ion|ions)?\b", r"\bestimate(d|s)?\b", r"\boutlook\b",
-        r"\btrend(s)?\b", r"\btrajectory\b", r"\bwhat will\b", r"\bexpected\b",
-        r"\bshould we expect\b", r"\bfuture\b"
-    ]
-    return any(re.search(p, ql) for p in patterns)
-
-def build_system_prompt(allow_general_knowledge: bool) -> str:
-    if not allow_general_knowledge:
-        return (
-            "You are a company assistant. Answer clearly and concisely using ONLY the provided context. "
-            "If the context is insufficient to answer, say you don't know and suggest which documents to consult. "
-            "Never invent numbers, dates, or facts that aren't in the context."
-        )
-    return (
-        "You are a company assistant. First, rely on the provided context. "
-        "If the question is predictive or the context is insufficient, you may use general domain knowledge "
-        "to produce a careful ESTIMATE. When you do, you must:\n"
-        "• Prefer ranges over point estimates.\n"
-        "• State key assumptions briefly.\n"
-        "• Indicate uncertainty level (Low/Medium/High).\n"
-        "• Never contradict the provided context; if context conflicts with general knowledge, follow the context.\n"
-        "• If no reasonable estimate can be made, say so.\n"
-        "Do not fabricate specific internal company numbers that aren't present in context."
-    )
-
-def summarize_chunks_for_context(rows):
-    if not rows:
-        return ""
-    return "\n\n".join(r.get("content", "") for r in rows if r.get("content"))
-
-# ==========================
-# INGESTION CORE LOGIC
-# ==========================
-async def run_ingestion(doc_id, org_id, storage_path, file_type, file_url=None):
-    try:
-        print(f"🚀 Starting ingestion for {doc_id} ({file_type})")
-
-        # Fetch file
-        if file_url:
-            resp = requests.get(file_url)
-            resp.raise_for_status()
-            tmp_path = f"/tmp/{os.path.basename(file_url)}"
-            with open(tmp_path, "wb") as f:
-                f.write(resp.content)
-        else:
-            public_url = f"{os.getenv('SUPABASE_URL')}/storage/v1/object/public/{storage_path}"
-            resp = requests.get(public_url)
-            resp.raise_for_status()
-            tmp_path = f"/tmp/{os.path.basename(storage_path)}"
-            with open(tmp_path, "wb") as f:
-                f.write(resp.content)
-
-        # Extract text
-        if tmp_path.endswith(".pdf"):
-            text = extract_text_from_pdf(tmp_path)
-        elif tmp_path.endswith(".docx"):
-            text = extract_text_from_docx(tmp_path)
-        elif tmp_path.endswith(".csv"):
-            text = extract_text_from_csv(tmp_path)
-        else:
-            text = ""
-
-        if not text.strip():
-            print(f"❌ No text extracted for {doc_id}")
-            return
-
-        # Split into chunks
-        chunk_size = 500
-        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-
-        # Embed + insert into Supabase
-        for idx, chunk in enumerate(chunks):
-            emb = openai.embeddings.create(
-                model="text-embedding-3-small",
-                input=chunk
-            )
-            embedding = emb.data[0].embedding
-
-            result = supabase.table("doc_chunks").insert({
-                "doc_id": doc_id,
-                "org_id": org_id,
-                "chunk_index": idx,
-                "content": chunk,
-                "embedding": embedding
-            }).execute()
-
-            print(f"🔎 Insert result for chunk {idx}: {result}")
-
-        print(f"✅ Ingested {len(chunks)} chunks for {doc_id}")
-    except Exception as e:
-        print(f"❌ Ingestion failed for {doc_id}: {e}")
-
-# ==========================
-# ROUTES
-# ==========================
-@app.get("/")
-def root():
-    return {"message": "Ingestion worker + RAG API is running."}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/upload")
-async def upload_file(file: UploadFile, org_id: str = Form(...)):
-    file_location = f"/tmp/{file.filename}"
-    with open(file_location, "wb") as f:
-        f.write(await file.read())
+# --------- Helpers ----------
+def chunk_text(txt: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    txt = (txt or "").strip()
+    if not txt:
+        return []
+    chunks = []
+    start = 0
+    n = len(txt)
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunks.append(txt[start:end])
+        if end == n:
+            break
+        start = max(0, end - overlap)
+    return chunks
 
-    if file.filename.endswith(".pdf"):
-        text = extract_text_from_pdf(file_location)
-    elif file.filename.endswith(".docx"):
-        text = extract_text_from_docx(file_location)
-    elif file.filename.endswith(".csv"):
-        text = extract_text_from_csv(file_location)
-    else:
-        text = ""
+def extract_text_from_pdf(file_path: str) -> str:
+    doc = fitz.open(file_path)
+    pages = [page.get_text("text") for page in doc]
+    return "\n".join(pages).strip()
 
-    return {"filename": file.filename, "length": len(text)}
+def extract_text_from_docx(file_path: str) -> str:
+    d = docx.Document(file_path)
+    return "\n".join([p.text for p in d.paragraphs]).strip()
 
-@app.post("/ingest")
-async def ingest_file(payload: dict):
-    await run_ingestion(
-        doc_id=payload.get("doc_id"),
-        org_id=payload.get("org_id"),
-        storage_path=payload.get("storage_path"),
-        file_type=payload.get("file_type"),
-        file_url=payload.get("file_url")
-    )
-    return {"message": f"Ingestion triggered for {payload.get('doc_id')}"}
+def extract_text_from_csv(file_path: str) -> str:
+    # Robust CSV → text: join header + rows with CSV-like formatting
+    try:
+        df = pd.read_csv(file_path)
+    except UnicodeDecodeError:
+        # try common encodings
+        for enc in ("utf-8-sig","latin-1"):
+            try:
+                df = pd.read_csv(file_path, encoding=enc)
+                break
+            except Exception:
+                df = None
+        if df is None:
+            raise
+    if df is None or df.empty:
+        return ""
+    # Convert to a readable text table: header then rows
+    lines = []
+    lines.append(", ".join(map(str, df.columns.tolist())))
+    for row in df.itertuples(index=False, name=None):
+        lines.append(", ".join(map(lambda x: "" if x is None else str(x), row)))
+    return "\n".join(lines)
 
-@app.post("/ask")
-async def ask(request: AskRequest):
-    predictive = is_predictive(request.question)
-    allow_general = (request.mode == "blend") and predictive
+def guess_extractor(mime: str, ext: str):
+    ext = (ext or "").lower()
+    mime = (mime or "").lower()
+    if ext.endswith(".pdf") or "pdf" in mime:
+        return "pdf"
+    if ext.endswith(".docx") or "word" in mime:
+        return "docx"
+    if ext.endswith(".csv") or "csv" in mime:
+        return "csv"
+    return "unknown"
 
-    emb_resp = openai.embeddings.create(
-        model="text-embedding-3-small",
-        input=request.question
-    )
-    embedding = emb_resp.data[0].embedding
+async def download_to_temp(bucket: str, path: str) -> str:
+    # Download using supabase storage and write to a temp file.
+    # NOTE: assumes the service key has access.
+    print(f"📥 Downloading: bucket={bucket} path={path}")
+    res = supabase.storage.from_(bucket).download(path)
+    # Some supabase clients return bytes directly; some return HTTPResponse-like objs.
+    file_bytes = res if isinstance(res, (bytes, bytearray)) else getattr(res, "content", None)
+    if not file_bytes:
+        raise RuntimeError("Download returned empty bytes")
+    print(f"   → bytes: {len(file_bytes)}")
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.write(file_bytes)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
 
-    rpc_payload = {
-        "query_embedding": embedding,
-        "match_threshold": request.match_threshold,
-        "match_count": request.match_count,
-        "org_id": request.org_id
-    }
-    results = supabase.rpc("match_documents", rpc_payload).execute()
-    rows = results.data or []
-    context_text = summarize_chunks_for_context(rows)
+async def insert_chunks(conn, org_id: str, doc_id: str, chunks: List[str]) -> int:
+    if not chunks:
+        return 0
+    embeddings = embed_texts(chunks)  # list of vectors
+    # Insert with asyncpg executemany
+    sql = """
+        insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
+        values ($1, $2, $3, $4, $5)
+    """
+    rows = [(org_id, doc_id, i, chunks[i], embeddings[i]) for i in range(len(chunks))]
+    await conn.executemany(sql, rows)
+    return len(rows)
 
-    system_prompt = build_system_prompt(allow_general_knowledge=allow_general)
-    temperature = 0.2 if not allow_general else 0.35
+async def process_one_job(conn, job: dict):
+    job_id     = job["id"]
+    org_id     = job["org_id"]
+    doc_id     = job["doc_id"]
+    bucket     = job["bucket"]
+    path       = job["path"]
+    mime_type  = job.get("mime_type") or ""
+    extension  = job.get("extension") or ""
 
-    user_msg = (
-        f"Question: {request.question}\n\n"
-        f"Context (company docs):\n{context_text if context_text else '(no relevant context retrieved)'}\n\n"
-        "Instructions:\n"
-        "- If using only the context, answer directly and concisely.\n"
-        "- If providing an estimate (allowed in this turn), clearly label it as 'Estimate', "
-        "add brief 'Assumptions', and an 'Uncertainty' level."
-    )
+    print(f"\n▶️  Processing job {job_id} (org={org_id}, doc={doc_id})")
 
-    completion = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg}
-        ]
-    )
+    await conn.execute("update ingestion_queue set status='processing', error=null where id=$1", job_id)
 
-    answer = completion.choices[0].message.content
+    # Download file to temp
+    local_path = await download_to_temp(bucket, path)
 
-    resp = {
-        "answer": answer,
-        "mode_used": "blend" if allow_general else "strict",
-    }
-    if request.debug:
-        resp["retrieval"] = [
-            {
-                "doc_id": r.get("doc_id"),
-                "chunk_index": r.get("chunk_index"),
-                "similarity": r.get("similarity"),
-                "snippet": (r.get("content") or "")[:400]
-            } for r in rows
-        ]
-        resp["retrieval_params"] = {
-            "match_threshold": request.match_threshold,
-            "match_count": request.match_count
-        }
+    # Extract text
+    which = guess_extractor(mime_type, extension)
+    try:
+        if which == "pdf":
+            text = extract_text_from_pdf(local_path)
+        elif which == "docx":
+            text = extract_text_from_docx(local_path)
+        elif which == "csv":
+            text = extract_text_from_csv(local_path)
+        else:
+            raise RuntimeError(f"Unsupported file type: mime={mime_type} ext={extension}")
+    except Exception as e:
+        await conn.execute(
+            "update ingestion_queue set status='failed', error=$2 where id=$1",
+            job_id, f"extract_error: {e}"
+        )
+        print(f"❌ Extract error: {e}")
+        return
 
-    return resp
+    print(f"🧾 Extracted text length: {len(text)}")
+    if len(text) == 0:
+        await conn.execute(
+            "update ingestion_queue set status='failed', error=$2 where id=$1",
+            job_id, "empty_text_after_extraction"
+        )
+        print("❌ Empty text; aborting.")
+        return
 
-# ==========================
-# QUEUE WORKER
-# ==========================
-async def process_queue():
-    while True:
-        try:
-            conn = await asyncpg.connect(DATABASE_URL)
+    # Chunk + embed + insert
+    chunks = chunk_text(text)
+    print(f"🪓 Chunk count: {len(chunks)}")
+    if not chunks:
+        await conn.execute(
+            "update ingestion_queue set status='failed', error=$2 where id=$1",
+            job_id, "no_chunks_generated"
+        )
+        print("❌ No chunks generated; aborting.")
+        return
+
+    try:
+        inserted = await insert_chunks(conn, org_id, doc_id, chunks)
+        print(f"✅ Inserted chunks: {inserted}")
+    except Exception as e:
+        await conn.execute(
+            "update ingestion_queue set status='failed', error=$2 where id=$1",
+            job_id, f"insert_error: {e}"
+        )
+        print(f"❌ Insert error: {e}")
+        return
+
+    # Success
+    await conn.execute("update ingestion_queue set status='done', error=null where id=$1", job_id)
+    print("🎉 Job completed.")
+
+async def process_queue_forever():
+    print("📡 Queue processor loop starting...")
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        while True:
             rows = await conn.fetch("""
-                update ingestion_queue
-                set status = 'processing', updated_at = now()
-                where id = (
-                    select id from ingestion_queue
-                    where status = 'pending'
-                    order by created_at
-                    for update skip locked
-                    limit 1
-                )
-                returning *;
+                select * from ingestion_queue
+                where status in ('queued','retry')
+                order by created_at asc
+                limit 1
             """)
+            if not rows:
+                await asyncio.sleep(3)
+                continue
 
-            if rows:
-                job = dict(rows[0])
-                print(f"📥 Picked up job: {job['id']} for doc {job['doc_id']}")
-
+            job = dict(rows[0])
+            try:
+                async with conn.transaction():
+                    await process_one_job(conn, job)
+            except Exception as e:
+                print(f"❌ Unexpected job error: {e}")
                 try:
-                    await run_ingestion(
-                        doc_id=job["doc_id"],
-                        org_id=job["org_id"],
-                        storage_path=job["storage_path"],
-                        file_type=job["file_type"],
-                    )
                     await conn.execute(
-                        "update ingestion_queue set status='done', updated_at=now() where id=$1",
-                        job["id"],
+                        "update ingestion_queue set status='failed', error=$2 where id=$1",
+                        job["id"], f"unexpected_error: {e}"
                     )
-                    print(f"✅ Job {job['id']} completed")
-                except Exception as e:
-                    await conn.execute(
-                        "update ingestion_queue set status='failed', error=$2, updated_at=now() where id=$1",
-                        job["id"], str(e),
-                    )
-                    print(f"❌ Job {job['id']} failed: {e}")
-            else:
-                await asyncio.sleep(5)
-
-            await conn.close()
-        except Exception as e:
-            print(f"❌ Queue processor error: {e}, retrying in 5s...")
-            await asyncio.sleep(5)
+                except Exception:
+                    pass
+            # small pause to avoid hot loop
+            await asyncio.sleep(0.5)
+    finally:
+        await conn.close()
 
 @app.on_event("startup")
-async def startup():
-    print("🚀 Worker starting up...")
-    loop = asyncio.get_event_loop()
-    loop.create_task(process_queue())
-    print("📡 Queue processor started")
+async def on_startup():
+    print("🚀 Worker starting…")
+    asyncio.create_task(process_queue_forever())
+    print("✅ Queue processor started")
