@@ -19,8 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy app source
 COPY . .
 
-# Expose port (Render sets $PORT dynamically, but EXPOSE helps for local dev)
+# Expose port (for local dev; Render sets $PORT dynamically)
 EXPOSE 8000
 
-# Run FastAPI with Uvicorn, binding to Render's dynamic $PORT
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "$PORT"]
+# Use shell form so $PORT gets expanded correctly
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT
