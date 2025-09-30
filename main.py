@@ -185,3 +185,23 @@ async def chat(org_id: str = Form(...), user_id: str = Form(...), question: str 
 @app.get("/")
 def root():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+async def listen_for_notifications():
+    print("🔔 Listening on ingest_channel")
+    async with await psycopg.AsyncConnection.connect(DB_URL_DIRECT) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("LISTEN ingest_channel;")
+            while True:
+                msg = await conn.notifies.get()
+                print(f"📩 Notification: {msg.payload}")
+                # TODO: decode JSON payload and call ingestion logic
+                data = json.loads(msg.payload)
+                org_id = data["org_id"]
+                doc_id = data["doc_id"]
+                uploader_id = data["uploader_id"]
+                # -> you can reuse your ingestion code here
+
+# Start listener on startup
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(listen_for_notifications())
