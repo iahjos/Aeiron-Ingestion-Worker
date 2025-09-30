@@ -84,28 +84,29 @@ async def process_document(org_id, doc_id, uploader_id, name, storage_path, mime
 
 
 # -------------------------
-# Listener
+# Listener for notifications
 # -------------------------
 async def listen_for_notifications():
-    async with await psycopg.AsyncConnection.connect(DB_URL_DIRECT) as conn:
-        await conn.execute("LISTEN ingest_channel;")
-        print("🔔 Listening on ingest_channel")
+    conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
+    await conn.execute("LISTEN ingest_channel;")
+    print("🔔 Listening on ingest_channel")
 
-        async for notify in conn.notifies():
-            print("📨 Got notification:", notify.payload)
+    try:
+        while True:
+            # Wait until a NOTIFY is received
+            msg = await conn.notifies.get()
+            print("📨 Got notification:", msg.payload)
+
             try:
-                payload = json.loads(notify.payload)
-                await process_document(
-                    org_id=payload["org_id"],
-                    doc_id=payload["doc_id"],
-                    uploader_id=payload["uploader_id"],
-                    name=payload["name"],
-                    storage_path=payload["storage_path"],
-                    mime_type=payload["mime_type"]
-                )
+                data = json.loads(msg.payload)
+                await handle_new_document(data)
             except Exception as e:
-                print("❌ Error processing notification:", e)
+                print("❌ Error handling notification:", e)
 
+    except Exception as e:
+        print("🔥 Listener crashed:", e)
+    finally:
+        await conn.close()
 
 @app.on_event("startup")
 async def startup_event():
