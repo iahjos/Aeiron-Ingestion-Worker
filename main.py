@@ -90,10 +90,11 @@ async def listen_for_notifications():
     conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
     async with conn.cursor() as cur:
         await cur.execute("LISTEN ingest_channel;")
-        await conn.commit()  # 🔑 ensure LISTEN takes effect
         print("🔔 Listening on ingest_channel")
 
-        async for notify in conn.notifies():
+    try:
+        while True:
+            notify = await conn.notifies.get()  # ✅ wait for next notification
             print("📨 Got notification:", notify.payload)
             try:
                 data = json.loads(notify.payload)
@@ -107,6 +108,8 @@ async def listen_for_notifications():
                 )
             except Exception as e:
                 print("❌ Error handling notification:", e)
+    finally:
+        await conn.close()
 
 @app.on_event("startup")
 async def startup_event():
