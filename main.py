@@ -6,8 +6,6 @@ import requests
 from fastapi import FastAPI, UploadFile, Form
 from openai import OpenAI
 from datetime import datetime
-
-# PDF/text extraction
 import fitz  # PyMuPDF
 from textwrap import wrap
 
@@ -29,6 +27,82 @@ app = FastAPI()
 # -------------------------
 def get_conn():
     return psycopg.connect(DB_URL_DIRECT, autocommit=True)
+
+
+# -------------------------
+# Processor: fetch + chunk + embed
+# -------------------------
+async def process_document(doc_id, org_id, contents, filename):
+    """Extracts, chunks, embeds, stores a document."""
+    text = ""
+    if filename.lower().endswith(".pdf"):
+        pdf = fitz.open(stream=contents, filetype="pdf")
+        for page in pdf:
+            text += page.get_text("text") + "\n"
+    else:
+        try:
+            text = contents.decode("utf-8")
+        except Exception:
+            text = ""
+
+    chunks = wrap(text, 1000)
+
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        emb = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=chunk
+        ).data[0].embedding
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
+                    values (%s, %s, %s, %s, %s)
+                """, (org_id, doc_id, i, chunk, emb))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("update documents set status='ready' where id=%s", (doc_id,))
+    print(f"✅ Finished processing doc {doc_id} ({len(chunks)} chunks)")
+
+
+# -------------------------
+# Listener: reacts to NOTIFY
+# -------------------------
+async def listen_for_notifications():
+    async with await psycopg.AsyncConnection.connect(DB_URL_DIRECT) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("LISTEN ingest_channel;")
+            print("👂 Listening on ingest_channel")
+
+            async for notify in conn.notifies():
+                print("📢 Got NOTIFY:", notify.payload)
+                try:
+                    payload = json.loads(notify.payload)
+                    doc_id = payload.get("doc_id")
+                    org_id = payload.get("org_id")
+                    filename = payload.get("name")
+                    storage_path = payload.get("storage_path")
+
+                    print(f"⚙️ Processing doc {doc_id} for org {org_id}")
+
+                    # Fetch file from Supabase storage
+                    url = f"{SUPABASE_URL}/storage/v1/object/{storage_path}"
+                    headers = {"Authorization": f"Bearer {SUPABASE_KEY}"}
+                    resp = requests.get(url, headers=headers)
+                    resp.raise_for_status()
+
+                    await process_document(doc_id, org_id, resp.content, filename)
+
+                except Exception as e:
+                    print("❌ Error in listener:", e)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(listen_for_notifications())
 
 
 # -------------------------
@@ -104,86 +178,6 @@ async def chat(org_id: str = Form(...), user_id: str = Form(...), question: str 
             """, (qid, answer, "gpt-4o-mini"))
 
     return {"answer": answer, "citations": [r[0] for r in rows]}
-
-
-# -------------------------
-# Processor: fetch + chunk + embed
-# -------------------------
-async def process_document(doc_id, org_id, contents, filename):
-    """Extracts, chunks, embeds, stores a document."""
-    text = ""
-    if filename.lower().endswith(".pdf"):
-        pdf = fitz.open(stream=contents, filetype="pdf")
-        for page in pdf:
-            text += page.get_text("text") + "\n"
-    else:
-        try:
-            text = contents.decode("utf-8")
-        except Exception:
-            text = ""
-
-    chunks = wrap(text, 1000)
-
-    for i, chunk in enumerate(chunks):
-        if not chunk.strip():
-            continue
-        emb = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=chunk
-        ).data[0].embedding
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
-                    values (%s, %s, %s, %s, %s)
-                """, (org_id, doc_id, i, chunk, emb))
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("update documents set status='ready' where id=%s", (doc_id,))
-    print(f"✅ Finished processing doc {doc_id} ({len(chunks)} chunks)")
-
-
-# -------------------------
-# Listener: reacts to NOTIFY
-# -------------------------
-async def listen_for_notifications():
-    async with await psycopg.AsyncConnection.connect(DB_URL_DIRECT) as conn:
-        async for notify in conn.notifies():
-            payload = json.loads(notify.payload)
-            print("Got NOTIFY:", payload)
-            await handle_new_document(payload)
-
-        while True:
-            notify = await conn.notifies.get()
-            print("📢 Got NOTIFY:", notify.payload)
-
-            try:
-                payload = json.loads(notify.payload)
-                doc_id = payload.get("doc_id")
-                org_id = payload.get("org_id")
-                filename = payload.get("name")
-                storage_path = payload.get("storage_path")
-
-                print(f"⚙️ Processing doc {doc_id} for org {org_id}")
-
-                # Fetch file from Supabase storage
-                url = f"{SUPABASE_URL}/storage/v1/object/{storage_path}"
-                headers = {"Authorization": f"Bearer {SUPABASE_KEY}"}
-                resp = requests.get(url, headers=headers)
-                resp.raise_for_status()
-
-                await process_document(doc_id, org_id, resp.content, filename)
-
-            except Exception as e:
-                print("❌ Error in listener:", e)
-
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(listen_for_notifications())
-
 
 # -------------------------
 # Healthcheck
