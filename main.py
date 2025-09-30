@@ -93,8 +93,7 @@ async def listen_for_notifications():
         print("🔔 Listening on ingest_channel")
 
     try:
-        while True:
-            notify = await conn.notifies.get()  # ✅ wait for next notification
+        async for notify in conn.notifies():
             print("📨 Got notification:", notify.payload)
             try:
                 data = json.loads(notify.payload)
@@ -108,6 +107,8 @@ async def listen_for_notifications():
                 )
             except Exception as e:
                 print("❌ Error handling notification:", e)
+    except Exception as e:
+        print("🔥 Listener crashed:", e)
     finally:
         await conn.close()
 
