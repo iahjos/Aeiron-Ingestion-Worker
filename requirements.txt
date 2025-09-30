@@ -1,12 +1,6 @@
 fastapi
-uvicorn
-supabase
+uvicorn[standard]
 openai
-PyMuPDF       # for PDF parsing
-python-docx   # for .docx parsing
-pandas        # for CSV parsing
-python-dotenv
+psycopg[binary]
+pymupdf
 python-multipart
-requests
-asyncpg
-httpx
