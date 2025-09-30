@@ -90,6 +90,7 @@ async def listen_for_notifications():
     conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
     async with conn.cursor() as cur:
         await cur.execute("LISTEN ingest_channel;")
+        await conn.commit()  # 🔑 ensure LISTEN takes effect
         print("🔔 Listening on ingest_channel")
 
         async for notify in conn.notifies():
