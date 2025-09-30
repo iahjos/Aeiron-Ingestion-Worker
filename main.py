@@ -149,10 +149,11 @@ async def process_document(doc_id, org_id, contents, filename):
 # Listener: reacts to NOTIFY
 # -------------------------
 async def listen_for_notifications():
-    conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
-    async with conn.cursor() as cur:
-        await cur.execute("LISTEN ingest_channel;")
-        print("👂 Listening on ingest_channel")
+    async with await psycopg.AsyncConnection.connect(DB_URL_DIRECT) as conn:
+        async for notify in conn.notifies():
+            payload = json.loads(notify.payload)
+            print("Got NOTIFY:", payload)
+            await handle_new_document(payload)
 
         while True:
             notify = await conn.notifies.get()
