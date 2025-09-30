@@ -24,8 +24,9 @@ app = FastAPI()
 def get_conn():
     return psycopg.connect(DB_URL_DIRECT, autocommit=True)
 
+
 # -------------------------
-# Ingestion Endpoint
+# Ingestion Endpoint (manual upload)
 # -------------------------
 @app.post("/upload")
 async def upload_file(file: UploadFile, org_id: str = Form(...), user_id: str = Form(...)):
@@ -57,7 +58,6 @@ async def upload_file(file: UploadFile, org_id: str = Form(...), user_id: str = 
             text += page.get_text("text") + "\n"
 
     # ---- Chunk text ----
-    # simple splitter, refine later
     chunks = wrap(text, 1000)
 
     # ---- Embed + insert ----
@@ -82,6 +82,7 @@ async def upload_file(file: UploadFile, org_id: str = Form(...), user_id: str = 
             cur.execute("update documents set status='ready' where id=%s", (doc_id,))
 
     return {"doc_id": doc_id, "chunks": len(chunks)}
+
 
 # -------------------------
 # Chat Endpoint
@@ -142,6 +143,40 @@ async def chat(org_id: str = Form(...), user_id: str = Form(...), question: str 
             """, (qid, answer, "gpt-4o-mini"))
 
     return {"answer": answer, "citations": [r[0] for r in rows]}
+
+
+# -------------------------
+# Listener for DB triggers
+# -------------------------
+async def listen_for_notifications():
+    conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
+    async with conn.cursor() as cur:
+        await cur.execute("LISTEN ingest_channel;")
+        print("✅ Listening on ingest_channel...")
+
+        while True:
+            notify = await conn.notifies.get()
+            print("📢 Got NOTIFY:", notify.payload)
+
+            try:
+                payload = json.loads(notify.payload)
+                doc_id = payload.get("doc_id")
+                org_id = payload.get("org_id")
+                uploader_id = payload.get("uploader_id")
+
+                print(f"⚙️ Processing doc {doc_id} for org {org_id}")
+
+                # For now, just log — next step you’d auto-chunk like /upload
+                # TODO: fetch file from Supabase storage, extract, embed, insert into doc_chunks
+
+            except Exception as e:
+                print("❌ Error handling NOTIFY:", e)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(listen_for_notifications())
+
 
 # -------------------------
 # Healthcheck
