@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-psycopg[binary]
 openai
+supabase
 python-multipart
 PyMuPDF
 requests

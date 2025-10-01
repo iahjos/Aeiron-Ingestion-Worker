@@ -1,7 +1,6 @@
 import os
 import json
 import asyncio
-import psycopg
 import requests
 import socket
 from fastapi import FastAPI, UploadFile, Form
@@ -9,38 +8,20 @@ from openai import OpenAI
 from datetime import datetime
 import fitz  # PyMuPDF
 from textwrap import wrap
+from supabase import create_client, Client
 
 # -------------------------
 # Load env
 # -------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-DB_URL_DIRECT = os.getenv("DATABASE_URL_DIRECT")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
 # Clients
 client = OpenAI(api_key=OPENAI_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 app = FastAPI()
-
-
-# -------------------------
-# Database helper
-# -------------------------
-def get_conn():
-    return psycopg.connect(DB_URL_DIRECT, autocommit=True)
-
-
-# -------------------------
-# Debug: DNS resolution check
-# -------------------------
-def debug_ipv4_resolution():
-    try:
-        host = DB_URL_DIRECT.split("@")[1].split(":")[0]
-        print("🌐 Testing DNS resolution for host:", host)
-        for res in socket.getaddrinfo(host, 5432):
-            print(" ->", res[0].name, res[4][0])
-    except Exception as e:
-        print("❌ DNS resolution check failed:", e)
 
 
 # -------------------------
@@ -49,15 +30,29 @@ def debug_ipv4_resolution():
 async def process_document(org_id, doc_id, uploader_id, name, storage_path, mime_type):
     print(f"🚀 Processing document {doc_id} for org {org_id}")
 
+    local_path = storage_path
     text = ""
+
     if mime_type == "application/pdf":
-        if os.path.exists(storage_path):
-            pdf = fitz.open(storage_path)
+        if os.path.exists(local_path):
+            pdf = fitz.open(local_path)
             for page in pdf:
                 text += page.get_text("text") + "\n"
         else:
-            print(f"⚠️ File {storage_path} not found locally")
-            return
+            # Try downloading from Supabase storage if not local
+            print(f"📥 Downloading {storage_path} from Supabase...")
+            url = f"{SUPABASE_URL}/storage/v1/object/public/{storage_path}"
+            headers = {"Authorization": f"Bearer {SUPABASE_KEY}"}
+            resp = requests.get(url, headers=headers)
+            if resp.status_code != 200:
+                print(f"❌ Failed to download {storage_path}, status {resp.status_code}")
+                return
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(resp.content)
+            pdf = fitz.open(local_path)
+            for page in pdf:
+                text += page.get_text("text") + "\n"
 
     chunks = wrap(text, 1000)
 
@@ -69,53 +64,56 @@ async def process_document(org_id, doc_id, uploader_id, name, storage_path, mime
             input=chunk
         ).data[0].embedding
 
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    insert into doc_chunks (org_id, doc_id, chunk_index, content, embedding)
-                    values (%s, %s, %s, %s, %s)
-                """, (org_id, doc_id, i, chunk, emb))
+        supabase.table("doc_chunks").insert({
+            "org_id": org_id,
+            "doc_id": doc_id,
+            "chunk_index": i,
+            "content": chunk,
+            "embedding": emb
+        }).execute()
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("update documents set status='ready' where id=%s", (doc_id,))
+    supabase.table("documents").update({"status": "ready"}).eq("id", doc_id).execute()
 
     print(f"✅ Finished processing {doc_id}, chunks: {len(chunks)}")
 
 
 # -------------------------
-# Listener for notifications
+# Realtime listener
 # -------------------------
-async def listen_for_notifications():
-    conn = await psycopg.AsyncConnection.connect(DB_URL_DIRECT)
-    async with conn.cursor() as cur:
-        await cur.execute("LISTEN ingest_channel;")
-        print("🔔 Listening on ingest_channel")
+async def on_insert(payload):
+    print("📨 New document inserted:", payload)
+    data = payload["new"]
 
-    try:
-        async for notify in conn.notifies():
-            print("📨 Got notification:", notify.payload)
-            try:
-                data = json.loads(notify.payload)
-                await process_document(
-                    data["org_id"],
-                    data["doc_id"],
-                    data["uploader_id"],
-                    data["name"],
-                    data["storage_path"],
-                    data["mime_type"],
-                )
-            except Exception as e:
-                print("❌ Error handling notification:", e)
-    except Exception as e:
-        print("🔥 Listener crashed:", e)
-    finally:
-        await conn.close()
+    await process_document(
+        data["org_id"],
+        data["id"],
+        data["uploader_id"],
+        data["name"],
+        data["storage_path"],
+        data["mime_type"]
+    )
+
+
+async def start_realtime_listener():
+    realtime = supabase.realtime
+    await realtime.connect()
+
+    channel = realtime.channel("documents-insert")
+    channel.on_postgres_changes(
+        event="INSERT",
+        schema="public",
+        table="documents",
+        callback=on_insert
+    )
+    await channel.subscribe()
+
+    print("🔔 Subscribed to Realtime inserts on documents")
+    await realtime.listen()
+
 
 @app.on_event("startup")
 async def startup_event():
-    debug_ipv4_resolution()
-    asyncio.create_task(listen_for_notifications())
+    asyncio.create_task(start_realtime_listener())
 
 
 # -------------------------
@@ -131,14 +129,17 @@ async def upload_file(file: UploadFile, org_id: str = Form(...), user_id: str = 
     with open(local_path, "wb") as f:
         f.write(contents)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                insert into documents (org_id, uploader_id, name, storage_path, status, mime_type)
-                values (%s, %s, %s, %s, 'uploaded', %s)
-                returning id
-            """, (org_id, user_id, filename, local_path, file.content_type))
-            doc_id = cur.fetchone()[0]
+    # Insert doc metadata into DB
+    response = supabase.table("documents").insert({
+        "org_id": org_id,
+        "uploader_id": user_id,
+        "name": filename,
+        "storage_path": local_path,
+        "status": "uploaded",
+        "mime_type": file.content_type
+    }).execute()
+
+    doc_id = response.data[0]["id"]
 
     await process_document(org_id, doc_id, user_id, filename, local_path, file.content_type)
 
@@ -155,18 +156,13 @@ async def chat(org_id: str = Form(...), user_id: str = Form(...), question: str 
         input=question
     ).data[0].embedding
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                select id, content, 1 - (embedding <=> %s::vector) as score
-                from doc_chunks
-                where org_id = %s
-                order by embedding <=> %s::vector
-                limit 8
-            """, (query_emb, org_id, query_emb))
-            rows = cur.fetchall()
+    rows = supabase.rpc("match_doc_chunks", {
+        "query_embedding": query_emb,
+        "match_count": 8,
+        "org_id": org_id
+    }).execute()
 
-    context = "\n\n".join([f"[{r[0]}] {r[1]}" for r in rows])
+    context = "\n\n".join([f"[{r['id']}] {r['content']}" for r in rows.data])
 
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -177,21 +173,13 @@ async def chat(org_id: str = Form(...), user_id: str = Form(...), question: str 
     )
     answer = completion.choices[0].message.content
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                insert into queries (org_id, user_id, question, created_at)
-                values (%s, %s, %s, now())
-                returning id
-            """, (org_id, user_id, question))
-            qid = cur.fetchone()[0]
+    supabase.table("queries").insert({
+        "org_id": org_id,
+        "user_id": user_id,
+        "question": question
+    }).execute()
 
-            cur.execute("""
-                insert into answers (query_id, content, model)
-                values (%s, %s, %s)
-            """, (qid, answer, "gpt-4o-mini"))
-
-    return {"answer": answer, "citations": [r[0] for r in rows]}
+    return {"answer": answer, "citations": [r["id"] for r in rows.data]}
 
 
 # -------------------------
