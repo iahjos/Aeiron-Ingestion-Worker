@@ -2,3 +2,5 @@ openai
 supabase
 PyMuPDF
 requests
+python-dotenv
+tenacity
