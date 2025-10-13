@@ -1,7 +1,4 @@
-fastapi
-uvicorn
 openai
 supabase
-python-multipart
 PyMuPDF
 requests
