@@ -1,26 +1,24 @@
-# Use a slim Python 3.11 image
+# =========================================
+# ✅ Aeiron Ingestion Worker - Dockerfile
+# =========================================
+
+# Base Python image
 FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies needed for PyMuPDF, pandas, etc.
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpoppler-cpp-dev \
-    pkg-config \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
+# Copy dependency list
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app source
+# Copy the rest of the project
 COPY . .
 
-# Expose port (for local dev; Render sets $PORT dynamically)
-EXPOSE 8000
+# Ensure logs flush immediately
+ENV PYTHONUNBUFFERED=1
 
-# Use shell form so $PORT gets expanded correctly
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# Default command for Render Background Worker
+CMD ["python", "main.py"]
