@@ -1,6 +1,7 @@
+supabase
+openai
 fastapi
 uvicorn
-supabase-py
-openai
-pydantic
-python-dotenv
+python-multipart
+PyMuPDF
+requests
