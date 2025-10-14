@@ -1,16 +1,95 @@
-# Python venv
+# -------------------------
+# 🐍 Python & Environment
+# -------------------------
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
 
-# Environment variables (sensitive keys)
+# Local environment files
 .env
+.env.local
+.env.production
+.env.development
 
-# macOS system files
-.DS_Store
+# -------------------------
+# ⚙️ Supabase
+# -------------------------
+.supabase/
+supabase/.temp/
+supabase/.cache/
+supabase/functions/.netlify/
+supabase/functions/*/node_modules/
 
-# Logs
+# -------------------------
+# 🐳 Docker
+# -------------------------
+*.pid
+*.seed
+*.db
+docker-compose.override.yml
+*.tar
 *.log
+*.bak
 
-# VS Code settings (optional, keeps your local setup private)
+# -------------------------
+# 🧠 Render Deployment
+# -------------------------
+.render/
+render.yaml.backup
+*.render.log
+
+# -------------------------
+# 💻 IDE & Editor
+# -------------------------
 .vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# -------------------------
+# 🍎 macOS system files
+# -------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# -------------------------
+# 🧩 Node (for Edge Functions)
+# -------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# -------------------------
+# 🧪 Test / Temp Files
+# -------------------------
+coverage/
+pytest_cache/
+*.tmp
+*.bak
+*.old
+*.log
+*.sqlite
+*.sqlite3
+
+# -------------------------
+# 📦 Custom Project Rules
+# -------------------------
+# Ignore local or backup folders for ingestion or web service
+__archive__/
+__backup__/
+temp/
+cache/
+data/
