@@ -36,7 +36,7 @@ logging.info("✅ Connected to Supabase project and OpenAI API successfully.")
 def fetch_pending_documents():
     """Fetch pending documents from Supabase (status = 'pending')"""
     try:
-        response = supabase.table("documents").select("*").eq("status", "pending").execute()
+        response = supabase.schema("public").table("documents").select("*").eq("status", "pending").execute()
         docs = response.data or []
         logging.info(f"📄 Found {len(docs)} pending documents.")
         return docs

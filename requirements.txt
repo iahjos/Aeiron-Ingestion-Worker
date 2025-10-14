@@ -1,6 +1,7 @@
-openai
 supabase
+openai
+fastapi
+uvicorn
+python-multipart
 PyMuPDF
 requests
-python-dotenv
-tenacity
