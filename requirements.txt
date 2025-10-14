@@ -1,16 +1,7 @@
-# Core Dependencies
 supabase
 openai
-requests
-python-dotenv
-
-# FastAPI Web Server
 fastapi
-uvicorn[standard]
+uvicorn
 python-multipart
-
-# Document Processing
 PyMuPDF
-
-# Optional — small helpers for async & error handling
-tenacity
+requests
