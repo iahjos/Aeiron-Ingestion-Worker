@@ -3,6 +3,9 @@ import time
 import json
 import logging
 import random
+import requests
+from io import BytesIO
+import fitz  # PyMuPDF
 from supabase import create_client, Client
 from openai import OpenAI
 
@@ -52,6 +55,30 @@ def update_document_status(doc_id, status):
     except Exception as e:
         logging.error(f"❌ Failed to update status for {doc_id}: {e}")
 
+def extract_text_from_pdf(file_url):
+    """Download and extract text from a PDF file stored in Supabase"""
+    try:
+        response = requests.get(file_url)
+        response.raise_for_status()
+        pdf_stream = BytesIO(response.content)
+        doc = fitz.open(stream=pdf_stream, filetype="pdf")
+
+        text = ""
+        for page in doc:
+            text += page.get_text("text") + "\n"
+        doc.close()
+
+        if not text.strip():
+            logging.warning(f"⚠️ No text found in PDF: {file_url}")
+            return None
+
+        logging.info(f"📘 Extracted {len(text)} characters from {file_url}")
+        return text.strip()
+
+    except Exception as e:
+        logging.error(f"❌ PDF extraction failed for {file_url}: {e}")
+        return None
+
 def embed_text(text):
     """Generate embedding using OpenAI"""
     try:
@@ -72,15 +99,17 @@ def process_document(doc):
     logging.info(f"🚀 Processing document {path} for org {org_id}")
 
     try:
-        # Example file URL from Supabase Storage
+        # File URL in Supabase Storage
         file_url = f"{SUPABASE_URL}/storage/v1/object/public/{path}"
         logging.info(f"🔗 Fetching file from {file_url}")
 
-        # Simulated text extraction (replace with PyMuPDF/docx/pandas later)
-        fake_text = f"This is a simulated ingestion for document {path}."
+        # Extract PDF text
+        extracted_text = extract_text_from_pdf(file_url)
+        if not extracted_text:
+            raise Exception("No text extracted from PDF.")
 
         # Generate embedding
-        embedding = embed_text(fake_text)
+        embedding = embed_text(extracted_text)
         if not embedding:
             raise Exception("Embedding generation failed.")
 
@@ -88,14 +117,15 @@ def process_document(doc):
         supabase.table("doc_chunks").insert({
             "doc_id": doc_id,
             "org_id": org_id,
-            "content": fake_text,
+            "content": extracted_text,
             "embedding": json.dumps(embedding)
         }).execute()
 
         # Mark document as processed
         update_document_status(doc_id, "processed")
 
-        time.sleep(1)  # brief cooldown to avoid API limits
+        logging.info(f"✅ Document {path} ingested successfully.")
+        time.sleep(1)
 
     except Exception as e:
         logging.error(f"❌ Error processing document {doc_id}: {e}")
@@ -112,7 +142,6 @@ def main():
             for doc in docs:
                 process_document(doc)
 
-            # Poll every ~10–15s
             sleep_time = 10 + random.randint(0, 5)
             time.sleep(sleep_time)
         except Exception as e:
