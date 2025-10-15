@@ -34,38 +34,41 @@ logging.info("✅ Connected to Supabase project and OpenAI API successfully.")
 # Helper functions
 # ----------------------------------------
 def fetch_pending_documents():
-    """Fetch pending documents from Supabase (status = 'pending')"""
+    """Fetch documents from Supabase where status = 'pending'"""
     try:
-        response = supabase.schema("public").table("documents").select("*").eq("status", "pending").execute()
+        response = supabase.table("documents").select("*").eq("status", "pending").execute()
         docs = response.data or []
         logging.info(f"📄 Found {len(docs)} pending documents.")
         return docs
     except Exception as e:
-        logging.error(f"❌ Error fetching documents: {e}")
+        logging.error(f"❌ Error fetching pending documents: {e}")
         return []
 
-def update_document_status(doc_id, status):
-    """Update document status in Supabase"""
+
+def update_document_status(doc_id: str, status: str):
+    """Update the processing status of a document"""
     try:
         supabase.table("documents").update({"status": status}).eq("id", doc_id).execute()
-        logging.info(f"✅ Updated document {doc_id} → status = {status}")
+        logging.info(f"✅ Updated document {doc_id} → {status}")
     except Exception as e:
-        logging.error(f"❌ Failed to update status for {doc_id}: {e}")
+        logging.error(f"❌ Failed to update document {doc_id} status: {e}")
 
-def embed_text(text):
-    """Generate embedding using OpenAI"""
+
+def embed_text(text: str):
+    """Generate text embeddings via OpenAI API"""
     try:
-        embedding = openai_client.embeddings.create(
+        response = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=text
-        ).data[0].embedding
-        return embedding
+        )
+        return response.data[0].embedding
     except Exception as e:
-        logging.error(f"❌ Embedding error: {e}")
+        logging.error(f"❌ Embedding generation failed: {e}")
         return None
 
-def extract_text_from_pdf(pdf_bytes):
-    """Extract text content from a PDF file (bytes)"""
+
+def extract_text_from_pdf(pdf_bytes: bytes):
+    """Extract readable text from PDF bytes"""
     try:
         text = ""
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -73,66 +76,75 @@ def extract_text_from_pdf(pdf_bytes):
                 text += page.get_text("text") + "\n"
         return text.strip()
     except Exception as e:
-        logging.error(f"❌ PDF extraction failed: {e}")
+        logging.error(f"❌ PDF extraction error: {e}")
         return ""
 
+
 def process_document(doc):
-    """Main ingestion logic"""
-    doc_id = doc["id"]
-    org_id = doc["org_id"]
-    path = doc["storage_path"]
-    logging.info(f"🚀 Processing document {path} for org {org_id}")
+    """Main ingestion pipeline for a single document"""
+    doc_id = doc.get("id")
+    org_id = doc.get("org_id")
+    path = doc.get("storage_path")
+
+    logging.info(f"🚀 Starting ingestion for {path} (org {org_id})")
 
     try:
-        # ✅ Step 1: Download file directly via Supabase client (no HTTP)
-        data = supabase.storage.from_("company_docs").download(path)
-        pdf_bytes = data  # file bytes
-        
-        # ✅ Step 2: Extract text content
+        # Step 1: Download file bytes directly from Supabase Storage
+        bucket_name, file_name = path.split("/", 1)
+        data = supabase.storage.from_(bucket_name).download(file_name)
+        pdf_bytes = data
+
+        # Step 2: Extract text
         text_content = extract_text_from_pdf(pdf_bytes)
-        if not text_content.strip():
+        if not text_content:
             raise Exception("No text extracted from PDF.")
 
-        # ✅ Step 3: Generate embedding
+        # Step 3: Generate embedding
         embedding = embed_text(text_content)
         if not embedding:
-            raise Exception("Embedding generation failed.")
+            raise Exception("Embedding creation failed.")
 
-        # ✅ Step 4: Insert chunks into doc_chunks
+        # Step 4: Insert document chunk
         supabase.table("doc_chunks").insert({
             "doc_id": doc_id,
             "org_id": org_id,
-            "content": text_content[:15000],  # limit for smaller docs
+            "content": text_content[:15000],  # limit for small docs
             "embedding": json.dumps(embedding)
         }).execute()
 
-        # ✅ Step 5: Mark as processed
+        # Step 5: Mark as processed
         update_document_status(doc_id, "processed")
-        logging.info(f"✅ Successfully processed document: {path}")
+        logging.info(f"✅ Successfully ingested {path}")
 
-        time.sleep(1)  # cooldown to prevent API overload
+        # cooldown for API safety
+        time.sleep(1)
 
     except Exception as e:
-        logging.error(f"❌ Error processing document {doc_id}: {e}")
+        logging.error(f"❌ Error processing document {path}: {e}")
         update_document_status(doc_id, "failed")
 
+
 # ----------------------------------------
-# Main ingestion loop
+# Main worker loop
 # ----------------------------------------
 def main():
-    logging.info("🟢 Ingestion worker started and listening for jobs...")
+    logging.info("🟢 Background worker is now listening for new documents...")
     while True:
         try:
             docs = fetch_pending_documents()
+            if not docs:
+                logging.info("⏳ No pending documents. Checking again soon...")
             for doc in docs:
                 process_document(doc)
 
-            # Poll every 10–15 seconds
+            # Sleep between polling intervals (10–15s)
             sleep_time = 10 + random.randint(0, 5)
             time.sleep(sleep_time)
+
         except Exception as e:
-            logging.error(f"Worker loop error: {e}")
+            logging.error(f"🔥 Worker loop encountered an error: {e}")
             time.sleep(15)
+
 
 if __name__ == "__main__":
     main()
