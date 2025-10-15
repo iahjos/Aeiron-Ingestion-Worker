@@ -3,10 +3,9 @@ import time
 import json
 import logging
 import random
-import requests
+import fitz  # PyMuPDF for PDF parsing
 from supabase import create_client, Client
 from openai import OpenAI
-import fitz  # PyMuPDF for real PDF text extraction
 
 # ----------------------------------------
 # Logging setup
@@ -14,29 +13,30 @@ import fitz  # PyMuPDF for real PDF text extraction
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ----------------------------------------
-# Environment setup
+# Load environment variables
 # ----------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise ValueError("❌ Missing Supabase credentials (URL or Service Role key).")
-
+    raise ValueError("Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
 if not OPENAI_API_KEY:
-    raise ValueError("❌ Missing OpenAI API key.")
+    raise ValueError("Missing OpenAI API key. Please set OPENAI_API_KEY.")
 
+# Initialize clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-logging.info("✅ Connected to Supabase and OpenAI successfully.")
+logging.info("✅ Connected to Supabase project and OpenAI API successfully.")
 
 # ----------------------------------------
-# Helpers
+# Helper functions
 # ----------------------------------------
 def fetch_pending_documents():
+    """Fetch pending documents from Supabase (status = 'pending')"""
     try:
-        response = supabase.table("documents").select("*").eq("status", "pending").execute()
+        response = supabase.schema("public").table("documents").select("*").eq("status", "pending").execute()
         docs = response.data or []
         logging.info(f"📄 Found {len(docs)} pending documents.")
         return docs
@@ -45,13 +45,15 @@ def fetch_pending_documents():
         return []
 
 def update_document_status(doc_id, status):
+    """Update document status in Supabase"""
     try:
         supabase.table("documents").update({"status": status}).eq("id", doc_id).execute()
-        logging.info(f"✅ Updated document {doc_id} → {status}")
+        logging.info(f"✅ Updated document {doc_id} → status = {status}")
     except Exception as e:
         logging.error(f"❌ Failed to update status for {doc_id}: {e}")
 
 def embed_text(text):
+    """Generate embedding using OpenAI"""
     try:
         embedding = openai_client.embeddings.create(
             model="text-embedding-3-small",
@@ -62,81 +64,72 @@ def embed_text(text):
         logging.error(f"❌ Embedding error: {e}")
         return None
 
-def generate_signed_url(path, expires_in=60):
-    """Generate a short-lived signed URL for a private Supabase file."""
+def extract_text_from_pdf(pdf_bytes):
+    """Extract text content from a PDF file (bytes)"""
     try:
-        result = supabase.storage.from_("company_docs").create_signed_url(path.replace("company_docs/", ""), expires_in)
-        signed_url = result.get("signedURL") or result.get("signed_url")
-        if not signed_url:
-            raise Exception("No signed URL returned from Supabase.")
-        full_url = f"{SUPABASE_URL}{signed_url}"
-        return full_url
-    except Exception as e:
-        logging.error(f"❌ Error generating signed URL: {e}")
-        return None
-
-def extract_text_from_pdf(url):
-    """Download and extract text from a PDF using PyMuPDF."""
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        with open("/tmp/temp.pdf", "wb") as f:
-            f.write(response.content)
-        doc = fitz.open("/tmp/temp.pdf")
         text = ""
-        for page in doc:
-            text += page.get_text("text")
-        doc.close()
-        if not text.strip():
-            raise Exception("No text extracted from PDF.")
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page in doc:
+                text += page.get_text("text") + "\n"
         return text.strip()
     except Exception as e:
-        logging.error(f"❌ PDF extraction failed for {url}: {e}")
-        return None
+        logging.error(f"❌ PDF extraction failed: {e}")
+        return ""
 
 def process_document(doc):
+    """Main ingestion logic"""
     doc_id = doc["id"]
     org_id = doc["org_id"]
     path = doc["storage_path"]
     logging.info(f"🚀 Processing document {path} for org {org_id}")
 
     try:
-        signed_url = generate_signed_url(path)
-        if not signed_url:
-            raise Exception("Could not generate signed URL.")
+        # ✅ Step 1: Download file directly via Supabase client (no HTTP)
+        data = supabase.storage.from_("company_docs").download(path)
+        pdf_bytes = data  # file bytes
+        
+        # ✅ Step 2: Extract text content
+        text_content = extract_text_from_pdf(pdf_bytes)
+        if not text_content.strip():
+            raise Exception("No text extracted from PDF.")
 
-        text = extract_text_from_pdf(signed_url)
-        if not text:
-            raise Exception("No text extracted.")
-
-        embedding = embed_text(text)
+        # ✅ Step 3: Generate embedding
+        embedding = embed_text(text_content)
         if not embedding:
             raise Exception("Embedding generation failed.")
 
+        # ✅ Step 4: Insert chunks into doc_chunks
         supabase.table("doc_chunks").insert({
             "doc_id": doc_id,
             "org_id": org_id,
-            "content": text[:1000],  # Limit to 1k chars per chunk (simplified)
+            "content": text_content[:15000],  # limit for smaller docs
             "embedding": json.dumps(embedding)
         }).execute()
 
+        # ✅ Step 5: Mark as processed
         update_document_status(doc_id, "processed")
-        time.sleep(1)
+        logging.info(f"✅ Successfully processed document: {path}")
+
+        time.sleep(1)  # cooldown to prevent API overload
+
     except Exception as e:
         logging.error(f"❌ Error processing document {doc_id}: {e}")
         update_document_status(doc_id, "failed")
 
 # ----------------------------------------
-# Main worker loop
+# Main ingestion loop
 # ----------------------------------------
 def main():
-    logging.info("🟢 Ingestion worker started...")
+    logging.info("🟢 Ingestion worker started and listening for jobs...")
     while True:
         try:
             docs = fetch_pending_documents()
             for doc in docs:
                 process_document(doc)
-            time.sleep(10 + random.randint(0, 5))
+
+            # Poll every 10–15 seconds
+            sleep_time = 10 + random.randint(0, 5)
+            time.sleep(sleep_time)
         except Exception as e:
             logging.error(f"Worker loop error: {e}")
             time.sleep(15)
