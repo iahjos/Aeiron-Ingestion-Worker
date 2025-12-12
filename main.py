@@ -92,7 +92,8 @@ def process_document(doc):
 
     try:
         # Step 1: Download file bytes directly from Supabase Storage
-        bucket_name, file_name = path.split("/", 1)
+        bucket_name = "company_docs"
+        file_name = path  # path is like: "<org_id>/<uuid>-filename.pdf"
         data = supabase.storage.from_(bucket_name).download(file_name)
         pdf_bytes = data
 
