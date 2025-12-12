@@ -111,7 +111,7 @@ def process_document(doc):
             "doc_id": doc_id,
             "org_id": org_id,
             "content": text_content[:15000],  # limit for small docs
-            "embedding": json.dumps(embedding)
+            "embedding": embedding
         }).execute()
 
         # Step 5: Mark as processed
